@@ -28,7 +28,7 @@ import { springs } from '../motion-presets';
 import { LocalDropHeader, LocalDropFooter } from './LocalDropChrome';
 import { Handshake, FileStack, TransferMotion, type StagedFile } from './LocalDropMotion';
 import { MotionErrorBoundary } from './MotionErrorBoundary';
-import { normalizeFiles, useSafeThumbnails, type NormalizedFile } from '../utils/fileAdapter';
+import { normalizeFiles, useSafeThumbnails, formatBytes, type NormalizedFile } from '../utils/fileAdapter';
 import '../localdrop.css';
 
 export type Transfer = {
@@ -97,25 +97,6 @@ export type Props = {
   channelSessionId: string | null;
   peerIsPhone?: boolean;
 };
-
-function formatBytes(bytes: number, decimals = 1): string {
-  if (!Number.isFinite(bytes) || bytes < 0) {
-    return '—';
-  }
-
-  if (bytes === 0) return '0 B';
-
-  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-
-  const index = Math.min(
-    Math.max(0, Math.floor(Math.log(bytes) / Math.log(1024))),
-    units.length - 1
-  );
-
-  const value = bytes / Math.pow(1024, index);
-
-  return `${Number(value.toFixed(decimals))} ${units[index]}`;
-}
 
 function StandardFileList({
   files,
