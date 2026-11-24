@@ -1,4 +1,4 @@
-/* LocalDrop final polish: add this stylesheet AFTER existing localdrop.css. */
+/* LocalDrop Design System & Chrome Tokens */
 .ld {
   --ldx-canvas: #f7f4ee;
   --ldx-ink: #252723;
@@ -173,7 +173,7 @@
   display: none;
 }
 
-/* v2: borderless utility toolbar */
+/* Borderless utility toolbar */
 .ldx-device-wrap {
   position: relative;
   min-width: 0;
@@ -345,7 +345,7 @@
   outline-offset: 3px;
 }
 
-/* v2: centered creator signature footer */
+/* Centered creator signature footer */
 .ldx-footer {
   margin-top: auto;
   padding: 22px 16px 26px;
