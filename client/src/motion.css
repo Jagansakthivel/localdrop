@@ -1,0 +1,337 @@
+@import '@fontsource-variable/manrope';
+@import '@fontsource-variable/geist';
+
+:root {
+  --ld-paper: #fffdf8;
+  --ld-ink: #252723;
+  --ld-accent: #c9472b;
+  --ld-sage: #dce5d2;
+  --ld-line: #dedbd1;
+}
+
+[data-theme='dark'],
+.dark,
+.ld-dark {
+  --ld-paper: #222722;
+  --ld-ink: #f5f1e8;
+  --ld-accent: #ff987d;
+  --ld-sage: #354637;
+  --ld-line: #465047;
+}
+
+.ld-number,
+.pairing-code,
+.pin-display {
+  font-family: 'Manrope Variable', sans-serif;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-feature-settings: 'zero' 0;
+  font-weight: 650;
+  letter-spacing: -0.045em;
+}
+
+.ld-handshake,
+.ld-stack,
+.ld-transfer {
+  font-family: 'Geist Variable', sans-serif;
+  color: var(--ld-ink);
+}
+
+.ld-handshake {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  background: rgb(30 28 24 / 22%);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+  padding: 16px;
+}
+
+.ld-handshake-sheet {
+  pointer-events: auto;
+  position: relative;
+  width: min(420px, 100%);
+  box-sizing: border-box;
+  padding: 32px;
+  background: var(--ld-paper);
+  border: 1px solid var(--ld-line);
+  border-radius: 28px;
+  box-shadow: 0 24px 70px rgba(23, 27, 32, 0.15);
+  text-align: center;
+}
+
+.ld-kicker {
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.13em;
+  color: var(--ld-ink);
+  opacity: 0.7;
+}
+
+.ld-handshake h2 {
+  font: 750 32px/1.1 'Manrope Variable', sans-serif;
+  letter-spacing: -0.06em;
+  margin: 14px 0 6px;
+}
+
+.ld-handshake p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: color-mix(in oklab, var(--ld-ink) 75%, transparent);
+}
+
+.ld-handshake-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 30px 0 20px;
+}
+
+.ld-device {
+  width: 94px;
+  flex: 0 1 94px;
+  background: var(--ld-sage);
+  border-radius: 22px;
+  padding: 8px;
+  box-shadow: 0 6px 0 color-mix(in oklab, var(--ld-sage), var(--ld-ink) 12%);
+}
+
+.ld-device svg {
+  display: block;
+  width: 100%;
+}
+
+.ld-peer {
+  background: color-mix(in oklab, var(--ld-paper), var(--ld-accent) 12%);
+}
+
+.ld-bridge {
+  width: 100px;
+  min-width: 35px;
+  color: var(--ld-accent);
+}
+
+.ld-dismiss {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.ld-dismiss,
+.ld-file-row button,
+.ld-text-button {
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 10px;
+  font: inherit;
+}
+
+.ld-text-button {
+  color: var(--ld-accent);
+  padding-left: 0;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.ld-text-button:hover {
+  text-decoration: underline;
+}
+
+.ld-stack {
+  border-top: 1px solid var(--ld-line);
+  padding: 22px 0;
+  margin-top: 18px;
+}
+
+.ld-stack-top {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+
+.ld-paper-stage {
+  position: relative;
+  width: 124px;
+  height: 112px;
+  flex-shrink: 0;
+}
+
+.ld-paper {
+  position: absolute;
+  left: 15px;
+  top: 15px;
+  width: 68px;
+  height: 88px;
+  border-radius: 8px;
+  background: var(--ld-paper);
+  border: 1px solid var(--ld-line);
+  box-shadow: 0 5px 10px rgba(0, 0, 0, 0.12);
+  overflow: hidden;
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.ld-paper img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.ld-extension {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ld-accent);
+}
+
+.ld-paper i {
+  display: block;
+  height: 3px;
+  background: var(--ld-line);
+  margin-top: 8px;
+  width: 85%;
+}
+
+.ld-paper i:last-child {
+  width: 55%;
+}
+
+.ld-stack h3 {
+  font: 700 30px/1.1 'Manrope Variable', sans-serif;
+  margin: 6px 0;
+  letter-spacing: -0.04em;
+}
+
+.ld-file-list {
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+.ld-file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--ld-line);
+  padding: 8px 0;
+  font-size: 13px;
+}
+
+.ld-file-row span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ld-file-row small {
+  white-space: nowrap;
+  color: color-mix(in oklab, var(--ld-ink) 60%, transparent);
+}
+
+.ld-file-row button {
+  font-size: 16px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 6px;
+}
+
+.ld-file-row button:hover {
+  background: color-mix(in oklab, var(--ld-ink) 8%, transparent);
+  color: var(--ld-accent);
+}
+
+.ld-transfer {
+  display: grid;
+  grid-template-columns: minmax(130px, 0.8fr) minmax(0, 1fr);
+  gap: 24px;
+  align-items: center;
+  border-top: 1px solid var(--ld-line);
+  padding: 18px 0;
+}
+
+.ld-transfer-art {
+  color: var(--ld-accent);
+  background: color-mix(in oklab, var(--ld-paper), var(--ld-accent) 6%);
+  border-radius: 14px;
+  border: 1px solid color-mix(in oklab, var(--ld-line) 60%, transparent);
+  overflow: hidden;
+}
+
+.ld-in .ld-transfer-art {
+  color: color-mix(in oklab, #43845b, var(--ld-ink) 20%);
+  background: color-mix(in oklab, var(--ld-paper), var(--ld-sage) 45%);
+}
+
+.ld-transfer-art svg {
+  width: 100%;
+  display: block;
+}
+
+.ld-transfer h3 {
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 8px 0 14px;
+}
+
+.ld-progress {
+  height: 4px;
+  background: var(--ld-line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.ld-progress div {
+  height: 100%;
+  background: var(--ld-accent);
+  transform-origin: left;
+}
+
+.ld-in .ld-progress div {
+  background: color-mix(in oklab, #43845b, var(--ld-ink) 20%);
+}
+
+.ld-metrics {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 13px;
+  color: color-mix(in oklab, var(--ld-ink) 75%, transparent);
+}
+
+.ld-handshake button:focus-visible,
+.ld-stack button:focus-visible {
+  outline: 2px solid var(--ld-accent);
+  outline-offset: 3px;
+}
+
+@media (max-width: 480px) {
+  .ld-transfer {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .ld-transfer-art {
+    max-width: 220px;
+  }
+  .ld-handshake-sheet {
+    padding: 24px;
+  }
+  .ld-handshake h2 {
+    font-size: 26px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ld-handshake *,
+  .ld-stack *,
+  .ld-transfer * {
+    scroll-behavior: auto !important;
+  }
+}

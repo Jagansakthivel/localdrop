@@ -1,0 +1,800 @@
+@import "tailwindcss";
+@import "@fontsource-variable/manrope";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+@import "./motion.css";
+@import "./components/localdrop-chrome.css";
+
+:root {
+  --paper: #f7f4ee;
+  --ink: #252723;
+  --muted: #666a60;
+  --accent: #c9472b;
+  --surface: #fffdf8;
+  --line: #dedbd1;
+  --sage: #dce5d2;
+  --forest: #344b3b;
+
+  --accent-soft: color-mix(in oklab, var(--accent) 10%, var(--surface));
+  --accent-hover: color-mix(in oklab, var(--accent) 85%, black);
+  --surface-hover: color-mix(in oklab, var(--ink) 5%, var(--surface));
+
+  min-height: 100dvh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'Geist Variable', -apple-system, BlinkMacSystemFont, sans-serif;
+  color-scheme: light;
+}
+
+.ld-dark {
+  --paper: #1b201d;
+  --ink: #f4f0e6;
+  --muted: #b7bcb0;
+  --accent: #ff987b;
+  --surface: #282e29;
+  --line: #41483f;
+  --sage: #2c382f;
+  --forest: #a2bca8;
+
+  --accent-soft: color-mix(in oklab, var(--accent) 15%, var(--surface));
+  --accent-hover: color-mix(in oklab, var(--accent) 80%, white);
+  --surface-hover: color-mix(in oklab, var(--ink) 8%, var(--surface));
+
+  background: var(--paper);
+  color: var(--ink);
+  color-scheme: dark;
+}
+
+.ld {
+  min-height: 100dvh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'Geist Variable', -apple-system, BlinkMacSystemFont, sans-serif;
+  display: flex;
+  flex-direction: column;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+.ld * {
+  box-sizing: border-box;
+}
+
+.ld button,
+.ld input,
+.ld textarea {
+  font: inherit;
+}
+
+.ld button {
+  cursor: pointer;
+  color: inherit;
+}
+
+.ld button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+}
+
+.ld :focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* Typography Classes */
+.display-heading {
+  font-family: "Manrope Variable", sans-serif;
+  font-size: clamp(44px, 7vw, 86px);
+  font-weight: 750;
+  letter-spacing: -0.075em;
+  line-height: 1.02;
+}
+
+.interface-text {
+  font-family: "Geist Variable", sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.numeric-data {
+  font-family: "Geist Mono Variable", ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  letter-spacing: -0.02em;
+}
+
+/* Header & Brand */
+.ld-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 24px clamp(20px, 5vw, 76px);
+  gap: 16px;
+  position: relative;
+  z-index: 20;
+}
+
+.ld-brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: 'Manrope Variable', sans-serif;
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -1.8px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.ld-period {
+  color: var(--accent);
+  margin-left: -7px;
+}
+
+.ld-mark {
+  position: relative;
+  width: 30px;
+  height: 26px;
+  margin-right: 5px;
+}
+
+.ld-mark i {
+  position: absolute;
+  width: 17px;
+  height: 17px;
+  border: 3px solid var(--accent);
+  border-radius: 6px;
+  transform: rotate(-22deg);
+  top: 1px;
+  left: 1px;
+}
+
+.ld-mark i + i {
+  top: 8px;
+  left: 12px;
+}
+
+.ld-tools,
+.ld-device,
+.ld-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ld-device {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.ld-icon,
+.ld-quiet {
+  background: transparent;
+  border: 0;
+  padding: 10px;
+  border-radius: 12px;
+  color: inherit;
+  transition: background 0.15s ease;
+}
+
+.ld-icon svg {
+  width: 19px;
+  height: 19px;
+}
+
+.ld-icon:hover,
+.ld-quiet:hover {
+  background: color-mix(in oklab, var(--ink) 7%, transparent);
+}
+
+/* Dynamic Island */
+.ld-island-wrapper {
+  position: sticky;
+  top: 16px;
+  z-index: 50;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+  padding: 0 16px;
+  margin-bottom: -16px;
+}
+
+.ld-island {
+  pointer-events: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 34px -8px rgba(37, 39, 35, 0.12), 0 2px 6px rgba(37, 39, 35, 0.04);
+  border-radius: 24px;
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--ink);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.ld-dark .ld-island {
+  box-shadow: 0 14px 40px -8px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.2);
+}
+
+.ld-island-pill {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #52936c;
+}
+
+.ld-island-pill.pulsing {
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(201, 71, 43, 0.4);
+  animation: islandPulse 1.8s infinite;
+}
+
+@keyframes islandPulse {
+  0% { box-shadow: 0 0 0 0 rgba(201, 71, 43, 0.5); }
+  70% { box-shadow: 0 0 0 6px rgba(201, 71, 43, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(201, 71, 43, 0); }
+}
+
+/* Main Layout */
+.ld-main {
+  width: min(100% - 40px, 1040px);
+  margin: auto;
+  padding: 36px 0 56px;
+  flex: 1;
+}
+
+/* Pairing View */
+.ld-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 30px 64px;
+  align-items: center;
+}
+
+.ld-intro h1,
+.ld-peer h1 {
+  font-family: 'Manrope Variable', sans-serif;
+  font-size: clamp(44px, 7vw, 86px);
+  line-height: 1.02;
+  letter-spacing: -0.075em;
+  margin: 20px 0;
+  font-weight: 750;
+}
+
+.ld-intro em {
+  font-style: normal;
+  color: var(--accent);
+}
+
+.ld-intro p,
+.ld-drop p {
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1.65;
+  max-width: 380px;
+}
+
+.ld-kicker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.ld-dot {
+  width: 8px;
+  height: 8px;
+  background: #52936c;
+  border-radius: 50%;
+}
+
+.ld-ticket {
+  grid-row: span 2;
+  border-radius: 28px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: 0 18px 50px rgba(41, 35, 24, 0.06);
+}
+
+.ld-dark .ld-ticket {
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+}
+
+.ld-art {
+  height: 190px;
+  background: var(--sage);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  color: var(--forest);
+  overflow: hidden;
+  position: relative;
+}
+
+.ld-machine,
+.ld-phone {
+  display: grid;
+  place-items: center;
+  background: var(--surface);
+  border: 1px solid color-mix(in oklab, var(--line) 90%, var(--forest));
+  border-radius: 20px;
+  width: 120px;
+  height: 100px;
+  box-shadow: 0 9px 0 color-mix(in oklab, var(--line) 90%, var(--forest));
+  transition: transform 0.3s ease;
+}
+
+.ld-phone {
+  width: 72px;
+  height: 110px;
+}
+
+.ld-orbit {
+  background: var(--accent);
+  color: white;
+  border-radius: 50%;
+  padding: 8px;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 4px 12px rgba(201, 71, 43, 0.3);
+}
+
+.ld-ticket-body {
+  padding: 28px;
+}
+
+.ld-label,
+.ld-connect label,
+.ld-clip label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.ld-pin,
+.pairing-code {
+  font-family: 'Manrope Variable', sans-serif;
+  font-size: clamp(44px, 5vw, 64px);
+  font-weight: 650;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-feature-settings: 'zero' 0;
+  letter-spacing: 0.025em;
+  line-height: 1.1;
+  margin: 12px 0 20px;
+  user-select: all;
+  color: var(--ink);
+}
+
+.ld-actions {
+  flex-wrap: wrap;
+}
+
+.ld-actions button,
+.ld-primary,
+.premium-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 12px 18px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: transparent;
+  font-weight: 600;
+  font-size: 14px;
+  transition: all 0.15s ease;
+}
+
+.ld .ld-primary,
+.premium-button {
+  background: var(--accent);
+  color: #ffffff;
+  border: 1px solid transparent;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 2px 5px rgba(0, 0, 0, 0.08);
+}
+
+.ld .ld-primary:hover,
+.premium-button:hover {
+  background: var(--accent-hover);
+}
+
+.ld-dark .ld-primary {
+  color: #1b201d;
+  font-weight: 700;
+}
+
+.ld-qr-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px;
+  background: #ffffff;
+  border-radius: 16px;
+  margin-top: 20px;
+  border: 1px solid var(--line);
+}
+
+.ld-qr {
+  display: block;
+  width: 150px;
+  height: 150px;
+  background: white;
+}
+
+.ld-inputrow {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.ld-inputrow input,
+.ld-clip textarea {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 14px;
+  letter-spacing: 0.18em;
+  transition: border-color 0.15s ease;
+}
+
+.ld-inputrow input:focus,
+.ld-clip textarea:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.ld-inputrow input {
+  font-family: 'Manrope Variable', sans-serif;
+  font-weight: 600;
+  font-variant-numeric: lining-nums tabular-nums;
+  font-feature-settings: 'zero' 0;
+  font-size: 22px;
+  letter-spacing: 0.22em;
+  text-align: center;
+}
+
+/* Connected View */
+.ld-peer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.ld-peer h1 {
+  font-size: clamp(32px, 5vw, 56px);
+  margin: 8px 0;
+}
+
+/* Segmented Navigation */
+.segmented-navigation,
+.ld-tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 5px;
+  border-radius: 16px;
+  background: color-mix(in oklab, var(--ink) 6%, var(--paper));
+  margin: 16px 0 24px;
+  border: 1px solid color-mix(in oklab, var(--line) 40%, transparent);
+}
+
+.segment,
+.ld-tabs button {
+  position: relative;
+  isolation: isolate;
+  padding: 10px 20px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  font-weight: 550;
+  font-size: 14px;
+  color: var(--ink);
+  transition: color 0.15s ease;
+}
+
+.segment-indicator,
+.ld-tab-bg {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 3px 8px rgba(0, 0, 0, 0.04);
+}
+
+.ld-dark .segment-indicator,
+.ld-dark .ld-tab-bg {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 3px 8px rgba(0, 0, 0, 0.2);
+}
+
+.segment-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Drop Zone */
+.ld-drop {
+  background: var(--surface);
+  border: 2px dashed var(--line);
+  border-radius: 28px;
+  padding: 44px 20px;
+  text-align: center;
+  transition: background 0.2s, border-color 0.2s, transform 0.2s;
+}
+
+.ld-drag {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.ld-plus {
+  display: grid;
+  place-items: center;
+  width: 68px;
+  height: 68px;
+  margin: auto;
+  border-radius: 22px;
+  background: var(--sage);
+  color: var(--forest);
+}
+
+.ld-drop h2 {
+  font-family: 'Manrope Variable', sans-serif;
+  font-size: 32px;
+  letter-spacing: -0.05em;
+  margin: 16px 0 0;
+  font-weight: 750;
+}
+
+.ld-drop p {
+  margin: 8px auto 20px;
+}
+
+.ld-drop .ld-actions {
+  justify-content: center;
+}
+
+/* Staged Files Queue */
+.ld-staged-queue {
+  margin-top: 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 18px;
+}
+
+.ld-staged-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.ld-staged-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin-bottom: 8px;
+  gap: 12px;
+}
+
+/* Activity List */
+.ld-activity {
+  font-family: 'Manrope Variable', sans-serif;
+  font-size: 22px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  margin: 36px 0 12px;
+  display: flex;
+  align-items: center;
+}
+
+.ld-activity span {
+  color: var(--muted);
+  font-size: 14px;
+  margin-left: 8px;
+  font-family: 'Geist Mono Variable', monospace;
+}
+
+.ld-list {
+  max-height: 400px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.ld-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.ld-fileicon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  flex: none;
+  color: var(--ink);
+}
+
+.ld-file {
+  flex: 1;
+  min-width: 0;
+}
+
+.ld-file strong,
+.ld-file small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ld-file strong {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.ld-file small,
+.ld-empty {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0;
+}
+
+.ld-progress {
+  height: 4px;
+  background: color-mix(in oklab, var(--line) 70%, transparent);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.ld-progress i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 4px;
+  transition: width 0.2s ease-out;
+}
+
+/* Clipboard Form */
+.ld-clip {
+  display: grid;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  padding: 24px;
+}
+
+.ld-clip textarea {
+  min-height: 140px;
+  letter-spacing: normal;
+  resize: vertical;
+}
+
+.ld-clip button {
+  justify-self: start;
+}
+
+/* Notice & Status */
+.ld-notice {
+  color: var(--accent);
+  font-size: 14px;
+  margin-top: 16px;
+  text-align: center;
+}
+
+.ld-notice:empty {
+  display: none;
+}
+
+/* Modal / Dialog */
+.ld-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(37, 39, 35, 0.45);
+  backdrop-filter: blur(8px);
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+}
+
+.ld-modal {
+  width: min(100%, 540px);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 28px;
+  padding: 32px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.16);
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.ld-modal-title {
+  font-family: 'Manrope Variable', sans-serif;
+  font-size: 24px;
+  font-weight: 750;
+  margin-bottom: 12px;
+}
+
+/* Footer */
+.ld-footer {
+  padding: 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.ld-footer span {
+  margin: 0 6px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 700px) {
+  .ld-pair {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+  .ld-ticket {
+    grid-row: auto;
+  }
+  .ld-device {
+    display: none;
+  }
+  .ld-main {
+    padding-top: 16px;
+  }
+  .ld-header {
+    padding: 16px 20px;
+  }
+  .ld-intro h1 {
+    font-size: 50px;
+  }
+  .ld-art {
+    height: 150px;
+  }
+  .ld-ticket-body {
+    padding: 22px;
+  }
+  .ld-inputrow .ld-primary {
+    flex: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ld * {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
+  }
+}
