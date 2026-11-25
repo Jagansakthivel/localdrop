@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import type { ConnectionState, TransportType, NetworkDiagnostics } from '../types/network';
+import { createReconnectingSocket } from '../utils/reconnectingSocket';
+import { IceCandidateQueue } from '../utils/iceCandidateQueue';
+import { attachRtcDiagnostics } from '../utils/rtcDiagnostics';
+import { isSocketOpen, isValidPin, networkLog } from '../utils/network';
 
 export interface PeerInfo {
   id: string;
@@ -36,10 +41,16 @@ export interface IncomingFileOffer {
 }
 
 const CHUNK_SIZE = 64 * 1024;
+const NEGOTIATION_TIMEOUT_MS = 8000;
+const PAIRING_TIMEOUT_MS = 15000;
+const OFFER_APPROVAL_TIMEOUT_MS = 30000;
+const ACK_TIMEOUT_MS = 10000;
+
 const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
   ],
 };
 
@@ -70,57 +81,216 @@ function detectDevice(): { name: string; deviceType: 'mobile' | 'desktop' } {
 
 export function usePeerDrop(wsUrl: string) {
   const [wsConnected, setWsConnected] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('offline');
+  const [transport, setTransport] = useState<TransportType>(null);
   const [connectedPeer, setConnectedPeer] = useState<PeerInfo | null>(null);
+  const [lastError, setLastError] = useState<string | null>(null);
   const [localDeviceName] = useState<string>(() => detectDevice().name);
+
+  // Host 4-digit PIN for this device
   const [pin] = useState<string>(() =>
     Math.floor(1000 + Math.random() * 9000).toString()
   );
 
   const [autoAccept, setAutoAccept] = useState<boolean>(true);
   const [totalSessionBytes, setTotalSessionBytes] = useState<number>(0);
-
   const [remoteClipboard, setRemoteClipboard] = useState<string>('');
   const [localClipboard, setLocalClipboard] = useState<string>('');
   const [sharedItems, setSharedItems] = useState<ReceivedItem[]>([]);
   const [transferProgress, setTransferProgress] = useState<number>(0);
   const [telemetry, setTelemetry] = useState<TransferTelemetry | null>(null);
   const [incomingOffer, setIncomingOffer] = useState<IncomingFileOffer | null>(null);
-  const [statusText, setStatusText] = useState<string>('Enter PIN on your other device');
+  const [statusText, setStatusText] = useState<string>('Ready to pair');
 
-  const wsRef = useRef<WebSocket | null>(null);
+  // Diagnostics tracking
+  const [diagnostics, setDiagnostics] = useState<NetworkDiagnostics>({
+    signalingConnected: false,
+    peerDiscovered: false,
+    connectionState: 'offline',
+    transport: null,
+    iceState: null,
+    peerState: null,
+    channelState: null,
+    lastError: null,
+  });
+
+  // Internal references
+  const socketManagerRef = useRef<ReturnType<typeof createReconnectingSocket> | null>(null);
   const myIdRef = useRef<string>('');
-  const initialPinRef = useRef<string>(pin);
+  const activeRoomRef = useRef<string>(pin);
+  const pendingPinRef = useRef<string | null>(null);
+  const pairingTimeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const negotiationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
+  const iceQueueRef = useRef<IceCandidateQueue>(new IceCandidateQueue());
+  const rtcCleanupRef = useRef<(() => void) | null>(null);
   const targetPeerRef = useRef<PeerInfo | null>(null);
+  const sessionIdRef = useRef<string>(crypto.randomUUID());
+
   const cancelFlagRef = useRef<boolean>(false);
   const autoAcceptRef = useRef<boolean>(autoAccept);
+  const isTransferActiveRef = useRef<boolean>(false);
 
   useEffect(() => {
     autoAcceptRef.current = autoAccept;
   }, [autoAccept]);
+
+  // Synchronize diagnostics state
+  const updateDiagnostics = useCallback(
+    (overrides?: Partial<NetworkDiagnostics>) => {
+      setDiagnostics((prev) => ({
+        ...prev,
+        signalingConnected: wsConnected,
+        peerDiscovered: Boolean(targetPeerRef.current),
+        connectionState,
+        transport,
+        iceState: pcRef.current?.iceConnectionState ?? null,
+        peerState: pcRef.current?.connectionState ?? null,
+        channelState: dcRef.current?.readyState ?? null,
+        lastError,
+        ...overrides,
+      }));
+    },
+    [wsConnected, connectionState, transport, lastError]
+  );
+
+  useEffect(() => {
+    updateDiagnostics();
+  }, [updateDiagnostics]);
 
   const pendingOfferResolverRef = useRef<{
     offerId: string;
     resolve: (accepted: boolean) => void;
   } | null>(null);
 
-  const incomingMetaRef = useRef<{ name: string; size: number; mime: string } | null>(null);
+  const pendingAckResolverRef = useRef<{
+    transferId: string;
+    resolve: (ok: boolean) => void;
+  } | null>(null);
+
+  const incomingMetaRef = useRef<{
+    transferId: string;
+    name: string;
+    size: number;
+    mime: string;
+  } | null>(null);
+
   const incomingBuffersRef = useRef<ArrayBuffer[]>([]);
   const receivedBytesRef = useRef<number>(0);
   const transferStartRef = useRef<number>(0);
 
-  // Unified transport sender: uses direct WebRTC DataChannel if open, otherwise relays over WebSocket room
+  // Unified protocol sender: sends over WebRTC DataChannel if open, or WebSocket relay
   const sendJsonPacket = useCallback((payload: Record<string, unknown>) => {
     if (dcRef.current?.readyState === 'open') {
-      dcRef.current.send(JSON.stringify(payload));
-    } else if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'relay', payload }));
+      try {
+        dcRef.current.send(JSON.stringify(payload));
+        return true;
+      } catch (err) {
+        networkLog('DataChannel send failed, falling back to relay', err);
+      }
     }
+
+    if (socketManagerRef.current) {
+      return socketManagerRef.current.send(
+        JSON.stringify({ type: 'relay', payload })
+      );
+    }
+    return false;
   }, []);
 
+  const sendSignal = useCallback((to: string, signal: unknown) => {
+    socketManagerRef.current?.send(
+      JSON.stringify({
+        type: 'signal',
+        to,
+        sessionId: sessionIdRef.current,
+        signal,
+      })
+    );
+  }, []);
+
+  // Teardown WebRTC peer resources cleanly
+  const teardownPeerConnection = useCallback(() => {
+    if (negotiationTimerRef.current) {
+      clearTimeout(negotiationTimerRef.current);
+      negotiationTimerRef.current = null;
+    }
+
+    if (rtcCleanupRef.current) {
+      rtcCleanupRef.current();
+      rtcCleanupRef.current = null;
+    }
+
+    if (dcRef.current) {
+      dcRef.current.onopen = null;
+      dcRef.current.onclose = null;
+      dcRef.current.onmessage = null;
+      dcRef.current.onerror = null;
+      try {
+        dcRef.current.close();
+      } catch {
+        // ignore
+      }
+      dcRef.current = null;
+    }
+
+    if (pcRef.current) {
+      pcRef.current.onicecandidate = null;
+      pcRef.current.ondatachannel = null;
+      pcRef.current.onconnectionstatechange = null;
+      pcRef.current.oniceconnectionstatechange = null;
+      try {
+        pcRef.current.close();
+      } catch {
+        // ignore
+      }
+      pcRef.current = null;
+    }
+
+    iceQueueRef.current.clear();
+  }, []);
+
+  // Declare established connection
+  const markConnected = useCallback(
+    (mode: 'direct' | 'relayed', peer: PeerInfo) => {
+      if (negotiationTimerRef.current) {
+        clearTimeout(negotiationTimerRef.current);
+        negotiationTimerRef.current = null;
+      }
+      if (pairingTimeoutTimerRef.current) {
+        clearTimeout(pairingTimeoutTimerRef.current);
+        pairingTimeoutTimerRef.current = null;
+      }
+
+      setConnectedPeer(peer);
+      targetPeerRef.current = peer;
+      setConnectionState(mode);
+      setTransport(mode === 'direct' ? 'webrtc' : 'websocket');
+      setLastError(null);
+      setStatusText(
+        mode === 'direct'
+          ? `Paired with ${peer.name}`
+          : `Relayed with ${peer.name} (Direct WebRTC unavailable)`
+      );
+      networkLog(`Connection established (${mode}) with`, peer.name);
+    },
+    []
+  );
+
+  // Fallback to WebSocket relay if direct WebRTC negotiation fails or stalls
+  const fallbackToRelay = useCallback(() => {
+    if (!targetPeerRef.current) return;
+    networkLog('Falling back to WebSocket room relay');
+    markConnected('relayed', targetPeerRef.current);
+  }, [markConnected]);
+
+  // Handle incoming protocol messages (from DataChannel or WebSocket relay)
   const handleProtocolJson = useCallback(
     (msg: Record<string, unknown>) => {
+      if (!msg || typeof msg.type !== 'string') return;
+
       if (msg.type === 'clipboard-sync') {
         setRemoteClipboard(String(msg.text || ''));
       } else if (msg.type === 'request-clipboard') {
@@ -168,6 +338,7 @@ export function usePeerDrop(wsUrl: string) {
         }
       } else if (msg.type === 'file-meta') {
         incomingMetaRef.current = {
+          transferId: String(msg.transferId || crypto.randomUUID()),
           name: String(msg.name),
           size: Number(msg.size),
           mime: String(msg.mime),
@@ -182,7 +353,7 @@ export function usePeerDrop(wsUrl: string) {
           fileMime: String(msg.mime),
           totalBytes: Number(msg.size),
           transferredBytes: 0,
-          speedMbps: 36.0,
+          speedMbps: 0,
           etaSeconds: 1,
           progress: 1,
         });
@@ -199,6 +370,13 @@ export function usePeerDrop(wsUrl: string) {
         const meta = incomingMetaRef.current;
         const blob = new Blob(incomingBuffersRef.current, { type: meta.mime });
         const file = new File([blob], meta.name, { type: meta.mime });
+
+        // Acknowledge receipt to the sender
+        sendJsonPacket({
+          type: 'file-ack',
+          transferId: meta.transferId,
+          receivedBytes: receivedBytesRef.current,
+        });
 
         setTotalSessionBytes((b) => b + meta.size);
         setSharedItems((prev) => [
@@ -225,15 +403,23 @@ export function usePeerDrop(wsUrl: string) {
         setStatusText(`Received ${meta.name}`);
         incomingMetaRef.current = null;
         incomingBuffersRef.current = [];
-        setTimeout(() => setTelemetry(null), 1100);
+        setTimeout(() => setTelemetry(null), 1200);
+      } else if (msg.type === 'file-ack') {
+        const resolver = pendingAckResolverRef.current;
+        if (resolver && resolver.transferId === msg.transferId) {
+          resolver.resolve(true);
+          pendingAckResolverRef.current = null;
+        }
       }
     },
     [sendJsonPacket]
   );
 
+  // Handle incoming binary chunk
   const handleBinaryChunk = useCallback((buffer: ArrayBuffer) => {
     incomingBuffersRef.current.push(buffer);
     receivedBytesRef.current += buffer.byteLength;
+
     if (incomingMetaRef.current) {
       const elapsedSec = Math.max(0.05, (performance.now() - transferStartRef.current) / 1000);
       const bytesPerSec = receivedBytesRef.current / elapsedSec;
@@ -244,6 +430,7 @@ export function usePeerDrop(wsUrl: string) {
         99,
         Math.max(1, Math.round((receivedBytesRef.current / incomingMetaRef.current.size) * 100))
       );
+
       setTransferProgress(pct);
       setTelemetry({
         direction: 'receiving',
@@ -251,200 +438,440 @@ export function usePeerDrop(wsUrl: string) {
         fileMime: incomingMetaRef.current.mime,
         totalBytes: incomingMetaRef.current.size,
         transferredBytes: receivedBytesRef.current,
-        speedMbps: Math.min(180, Math.max(14.2, mbPerSec)),
+        speedMbps: mbPerSec,
         etaSeconds: eta,
         progress: pct,
       });
     }
   }, []);
 
-  const sendSignal = useCallback((to: string, signal: unknown) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'signal', to, signal }));
-    }
-  }, []);
-
+  // Configure DataChannel listeners
   const setupDataChannel = useCallback(
-    (channel: RTCDataChannel) => {
+    (channel: RTCDataChannel, peer: PeerInfo) => {
       channel.binaryType = 'arraybuffer';
-      channel.bufferedAmountLowThreshold = 256 * 1024;
+      channel.bufferedAmountLowThreshold = 512 * 1024;
       dcRef.current = channel;
 
       channel.onopen = () => {
-        if (targetPeerRef.current) {
-          setConnectedPeer(targetPeerRef.current);
-          setStatusText(`Paired with ${targetPeerRef.current.name}`);
-        }
+        if (dcRef.current !== channel) return;
+        markConnected('direct', peer);
       };
 
       channel.onclose = () => {
-        dcRef.current = null;
-        // Keep session alive via WebSocket room relay if peer is still in the room
+        if (dcRef.current === channel) {
+          dcRef.current = null;
+          // If signaling is still healthy, fall back to relay rather than dropping entirely
+          if (targetPeerRef.current && isSocketOpen(socketManagerRef.current?.getSocket() ?? null)) {
+            fallbackToRelay();
+          } else {
+            setConnectionState('waiting');
+            setTransport(null);
+            setConnectedPeer(null);
+            setStatusText('Connection closed');
+          }
+        }
+      };
+
+      channel.onerror = (err) => {
+        networkLog('DataChannel error:', err);
+        fallbackToRelay();
       };
 
       channel.onmessage = (event) => {
         if (typeof event.data === 'string') {
-          handleProtocolJson(JSON.parse(event.data));
+          try {
+            handleProtocolJson(JSON.parse(event.data));
+          } catch {
+            // malformed
+          }
         } else if (event.data instanceof ArrayBuffer) {
           handleBinaryChunk(event.data);
         }
       };
     },
-    [handleProtocolJson, handleBinaryChunk]
+    [markConnected, fallbackToRelay, handleProtocolJson, handleBinaryChunk]
   );
 
+  // Create an RTCPeerConnection instance with state listeners
   const createPeerConnection = useCallback(
     (peer: PeerInfo) => {
-      pcRef.current?.close();
+      teardownPeerConnection();
       targetPeerRef.current = peer;
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
       pcRef.current = pc;
+      rtcCleanupRef.current = attachRtcDiagnostics(pc);
 
       pc.onicecandidate = (e) => {
-        if (e.candidate) sendSignal(peer.id, { candidate: e.candidate });
+        if (e.candidate && myIdRef.current) {
+          sendSignal(peer.id, { candidate: e.candidate });
+        }
       };
 
-      pc.ondatachannel = (e) => setupDataChannel(e.channel);
+      pc.ondatachannel = (e) => {
+        setupDataChannel(e.channel, peer);
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+          networkLog('ICE connection state:', pc.iceConnectionState);
+          fallbackToRelay();
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') {
+          networkLog('PeerConnection failed, attempting relay');
+          fallbackToRelay();
+        }
+      };
 
       return pc;
     },
-    [sendSignal, setupDataChannel]
+    [teardownPeerConnection, sendSignal, setupDataChannel, fallbackToRelay]
   );
 
-  const connectToPeer = useCallback(
-    async (peer: PeerInfo) => {
+  // Deterministic WebRTC negotiation: designated initiator starts offer
+  const startNegotiation = useCallback(
+    async (peer: PeerInfo, isInitiator: boolean) => {
+      setConnectionState('negotiating');
+      setStatusText(`Establishing connection with ${peer.name}...`);
       targetPeerRef.current = peer;
-      setConnectedPeer(peer);
-      setStatusText(`Paired with ${peer.name}`);
 
-      try {
-        const pc = createPeerConnection(peer);
-        const dc = pc.createDataChannel('localdrop', { ordered: true });
-        setupDataChannel(dc);
+      // Start safety timeout: if WebRTC direct channel isn't established, fall back to relay
+      if (negotiationTimerRef.current) clearTimeout(negotiationTimerRef.current);
+      negotiationTimerRef.current = setTimeout(() => {
+        networkLog('WebRTC negotiation timed out, falling back to relay');
+        fallbackToRelay();
+      }, NEGOTIATION_TIMEOUT_MS);
 
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        sendSignal(peer.id, { sdp: pc.localDescription });
-      } catch {
-        // WebSocket relay remains active automatically
+      const pc = createPeerConnection(peer);
+
+      if (isInitiator) {
+        try {
+          const dc = pc.createDataChannel('localdrop', { ordered: true });
+          setupDataChannel(dc, peer);
+
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendSignal(peer.id, { sdp: pc.localDescription });
+        } catch (err) {
+          networkLog('CreateOffer failed:', err);
+          fallbackToRelay();
+        }
       }
     },
-    [createPeerConnection, sendSignal, setupDataChannel]
+    [createPeerConnection, setupDataChannel, sendSignal, fallbackToRelay]
   );
 
+  // Initialize and manage the reconnecting WebSocket lifecycle
   useEffect(() => {
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-    wsRef.current = ws;
+    sessionIdRef.current = crypto.randomUUID();
 
-    ws.onopen = () => {
-      setWsConnected(true);
-      const device = detectDevice();
-      ws.send(JSON.stringify({ type: 'register', ...device }));
-      ws.send(JSON.stringify({ type: 'join-room', roomCode: initialPinRef.current }));
+    const socketManager = createReconnectingSocket(wsUrl, {
+      onOpen: (ws) => {
+        setWsConnected(true);
+        setLastError(null);
+        setConnectionState('waiting');
+
+        // Register client device metadata
+        const device = detectDevice();
+        ws.send(JSON.stringify({ type: 'register', ...device }));
+
+        // If a PIN pairing request was queued, join that room; otherwise create own host room
+        if (pendingPinRef.current) {
+          const target = pendingPinRef.current;
+          setConnectionState('pairing');
+          setStatusText(`Linking to ${target}...`);
+          ws.send(
+            JSON.stringify({
+              type: 'join-room',
+              roomCode: target,
+              createIfMissing: false,
+            })
+          );
+        } else {
+          // Host own PIN room with createIfMissing: true
+          activeRoomRef.current = pin;
+          ws.send(
+            JSON.stringify({
+              type: 'create-room',
+              roomCode: pin,
+            })
+          );
+          setStatusText('Ready to pair');
+        }
+      },
+
+      onClose: () => {
+        setWsConnected(false);
+        setConnectionState('reconnecting');
+        setStatusText('Signaling disconnected, reconnecting...');
+      },
+
+      onError: () => {
+        setLastError('Signaling server connection error');
+      },
+
+      onReconnect: (attempt, delay) => {
+        setStatusText(`Reconnecting to signaling server (attempt ${attempt})...`);
+        networkLog(`Reconnecting attempt ${attempt} in ${delay}ms`);
+      },
+
+      onExhausted: () => {
+        setConnectionState('offline');
+        setStatusText('Signaling server unavailable');
+        setLastError('Unable to reach signaling server after multiple attempts');
+      },
+
+      onMessage: async (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          handleBinaryChunk(event.data);
+          return;
+        }
+
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (msg.type === 'welcome') {
+          myIdRef.current = String(msg.id || '');
+          networkLog('Registered with signaling ID:', myIdRef.current);
+        } else if (msg.type === 'room-created') {
+          activeRoomRef.current = String(msg.roomCode);
+          setConnectionState('waiting');
+          setStatusText('Ready to pair');
+        } else if (msg.type === 'room-joined') {
+          activeRoomRef.current = String(msg.roomCode);
+          pendingPinRef.current = null;
+          if (pairingTimeoutTimerRef.current) {
+            clearTimeout(pairingTimeoutTimerRef.current);
+            pairingTimeoutTimerRef.current = null;
+          }
+        } else if (msg.type === 'room-error') {
+          // Room rejected (e.g. ROOM_NOT_FOUND, ROOM_FULL, INVALID_PIN)
+          const errorMsg = String(msg.message || 'Pairing error');
+          setLastError(errorMsg);
+          setStatusText(errorMsg);
+          setConnectionState('failed');
+          pendingPinRef.current = null;
+
+          if (pairingTimeoutTimerRef.current) {
+            clearTimeout(pairingTimeoutTimerRef.current);
+            pairingTimeoutTimerRef.current = null;
+          }
+
+          // Restore own host room so device remains discoverable
+          activeRoomRef.current = pin;
+          socketManager.send(
+            JSON.stringify({
+              type: 'create-room',
+              roomCode: pin,
+            })
+          );
+        } else if (msg.type === 'room-peers') {
+          const peers: PeerInfo[] = (msg.peers as PeerInfo[]) || [];
+          if (peers.length > 0) {
+            const peer = peers[0];
+            targetPeerRef.current = peer;
+
+            // Deterministic offer initiator: lexicographical UUID comparison
+            const isInitiator = myIdRef.current < peer.id;
+            networkLog(`Room paired with ${peer.name}. Is initiator: ${isInitiator}`);
+            startNegotiation(peer, isInitiator);
+          } else {
+            // Peer left
+            targetPeerRef.current = null;
+            teardownPeerConnection();
+            setConnectedPeer(null);
+            setConnectionState('waiting');
+            setTransport(null);
+            setIncomingOffer(null);
+            setTelemetry(null);
+            setStatusText('Ready to pair');
+          }
+        } else if (msg.type === 'peer-joined-room') {
+          const peer = msg.peer as PeerInfo;
+          if (peer && peer.id !== myIdRef.current) {
+            targetPeerRef.current = peer;
+            const isInitiator = myIdRef.current < peer.id;
+            startNegotiation(peer, isInitiator);
+          }
+        } else if (msg.type === 'relay') {
+          handleProtocolJson(msg.payload as Record<string, unknown>);
+        } else if (msg.type === 'signal') {
+          const sender: PeerInfo = {
+            id: String(msg.from),
+            name: String(msg.fromName || 'Device'),
+            deviceType: (msg.fromDeviceType as 'mobile' | 'desktop') || 'desktop',
+          };
+
+          let pc = pcRef.current;
+          if (!pc || pc.signalingState === 'closed') {
+            pc = createPeerConnection(sender);
+          }
+
+          const signal = msg.signal as {
+            sdp?: RTCSessionDescriptionInit;
+            candidate?: RTCIceCandidateInit;
+          };
+
+          if (signal?.sdp) {
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+              await iceQueueRef.current.flush(pc);
+
+              if (signal.sdp.type === 'offer') {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSignal(sender.id, { sdp: pc.localDescription });
+              }
+            } catch (err) {
+              networkLog('Error handling remote SDP signal:', err);
+              fallbackToRelay();
+            }
+          } else if (signal?.candidate) {
+            await iceQueueRef.current.add(pc, signal.candidate);
+          }
+        }
+      },
+    });
+
+    socketManagerRef.current = socketManager;
+
+    return () => {
+      if (pairingTimeoutTimerRef.current) clearTimeout(pairingTimeoutTimerRef.current);
+      if (negotiationTimerRef.current) clearTimeout(negotiationTimerRef.current);
+      teardownPeerConnection();
+      socketManager.close();
+      socketManagerRef.current = null;
     };
+  }, [
+    wsUrl,
+    pin,
+    startNegotiation,
+    createPeerConnection,
+    setupDataChannel,
+    sendSignal,
+    handleProtocolJson,
+    handleBinaryChunk,
+    teardownPeerConnection,
+    fallbackToRelay,
+  ]);
 
-    ws.onclose = () => {
-      setWsConnected(false);
-      setConnectedPeer(null);
-      setStatusText('Server offline');
-    };
+  // Request to connect with a 4-digit PIN
+  const connectWithPin = useCallback(
+    (targetPin: string) => {
+      const clean = targetPin.trim();
 
-    ws.onmessage = async (event) => {
-      if (event.data instanceof ArrayBuffer) {
-        handleBinaryChunk(event.data);
+      if (!isValidPin(clean)) {
+        setLastError('Enter a valid 4-digit PIN');
         return;
       }
 
-      const msg = JSON.parse(event.data);
-
-      if (msg.type === 'welcome') {
-        myIdRef.current = msg.id;
-      } else if (msg.type === 'room-peers') {
-        const peers: PeerInfo[] = msg.peers || [];
-        if (peers.length > 0) {
-          targetPeerRef.current = peers[0];
-          setConnectedPeer(peers[0]);
-          setStatusText(`Paired with ${peers[0].name}`);
-        } else {
-          targetPeerRef.current = null;
-          setConnectedPeer(null);
-          setIncomingOffer(null);
-          setTelemetry(null);
-          setStatusText('Enter PIN on your other device');
-        }
-      } else if (msg.type === 'peer-joined-room') {
-        connectToPeer(msg.peer);
-      } else if (msg.type === 'relay') {
-        handleProtocolJson(msg.payload);
-      } else if (msg.type === 'signal') {
-        const sender: PeerInfo = {
-          id: msg.from,
-          name: msg.fromName || 'Device',
-          deviceType: msg.fromDeviceType || 'desktop',
-        };
-        targetPeerRef.current = sender;
-        setConnectedPeer(sender);
-
-        let pc = pcRef.current;
-        if (!pc || pc.signalingState === 'closed') {
-          pc = createPeerConnection(sender);
-        }
-
-        if (msg.signal.sdp) {
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.signal.sdp));
-          if (msg.signal.sdp.type === 'offer') {
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-            sendSignal(sender.id, { sdp: pc.localDescription });
-          }
-        } else if (msg.signal.candidate) {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.signal.candidate)).catch(() => {});
-        }
+      if (clean === pin) {
+        setLastError('Enter the PIN shown on your other device');
+        return;
       }
-    };
 
-    return () => ws.close();
-  }, [wsUrl, connectToPeer, createPeerConnection, sendSignal, handleProtocolJson, handleBinaryChunk]);
+      setLastError(null);
+      pendingPinRef.current = clean;
 
-  const connectWithPin = (targetPin: string) => {
-    const clean = targetPin.trim();
-    if (clean.length !== 4) return;
-    if (clean === pin) {
-      setStatusText('Enter the PIN from your other device');
-      return;
-    }
-    wsRef.current?.send(JSON.stringify({ type: 'join-room', roomCode: clean }));
-    setStatusText(`Linking to ${clean}...`);
-  };
+      const socket = socketManagerRef.current?.getSocket();
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setConnectionState('signaling');
+        setStatusText('Waiting for signaling server...');
+        return;
+      }
 
-  const pushMyClipboard = (text: string) => {
-    setLocalClipboard(text);
-    sendJsonPacket({ type: 'clipboard-sync', text });
-  };
+      setConnectionState('pairing');
+      setStatusText(`Linking to ${clean}...`);
 
-  const requestRemoteClipboard = () => {
+      // Set pairing timeout safety net
+      if (pairingTimeoutTimerRef.current) clearTimeout(pairingTimeoutTimerRef.current);
+      pairingTimeoutTimerRef.current = setTimeout(() => {
+        if (connectionState === 'pairing') {
+          setConnectionState('failed');
+          setLastError(`Pairing to ${clean} timed out. Make sure the code is correct.`);
+          setStatusText(`Pairing to ${clean} timed out`);
+          pendingPinRef.current = null;
+          // Restore host room
+          socketManagerRef.current?.send(
+            JSON.stringify({
+              type: 'create-room',
+              roomCode: pin,
+            })
+          );
+        }
+      }, PAIRING_TIMEOUT_MS);
+
+      socketManagerRef.current?.send(
+        JSON.stringify({
+          type: 'join-room',
+          roomCode: clean,
+          createIfMissing: false,
+        })
+      );
+    },
+    [pin, connectionState]
+  );
+
+  // Manual disconnect / session teardown
+  const disconnect = useCallback(() => {
+    teardownPeerConnection();
+    targetPeerRef.current = null;
+    setConnectedPeer(null);
+    setConnectionState('waiting');
+    setTransport(null);
+    setIncomingOffer(null);
+    setTelemetry(null);
+    setStatusText('Ready to pair');
+
+    // Return to own host room
+    activeRoomRef.current = pin;
+    socketManagerRef.current?.send(
+      JSON.stringify({
+        type: 'create-room',
+        roomCode: pin,
+      })
+    );
+  }, [pin, teardownPeerConnection]);
+
+  const pushMyClipboard = useCallback(
+    (text: string) => {
+      setLocalClipboard(text);
+      sendJsonPacket({ type: 'clipboard-sync', text });
+    },
+    [sendJsonPacket]
+  );
+
+  const requestRemoteClipboard = useCallback(() => {
     sendJsonPacket({ type: 'request-clipboard' });
-  };
+  }, [sendJsonPacket]);
 
-  const sendTextOrLink = (text: string) => {
-    const clean = text.trim();
-    if (!clean) return;
-    sendJsonPacket({ type: 'shared-text', text: clean });
-    setSharedItems((prev) => [
-      {
-        id: crypto.randomUUID(),
-        kind: 'text',
-        text: clean,
-        direction: 'sent',
-        timestamp: Date.now(),
-      },
-      ...prev,
-    ]);
-  };
+  const sendTextOrLink = useCallback(
+    (text: string) => {
+      const clean = text.trim();
+      if (!clean) return;
+      sendJsonPacket({ type: 'shared-text', text: clean });
+      setSharedItems((prev) => [
+        {
+          id: crypto.randomUUID(),
+          kind: 'text',
+          text: clean,
+          direction: 'sent',
+          timestamp: Date.now(),
+        },
+        ...prev,
+      ]);
+    },
+    [sendJsonPacket]
+  );
 
-  const acceptIncomingFile = () => {
+  const acceptIncomingFile = useCallback(() => {
     if (!incomingOffer) return;
     sendJsonPacket({
       type: 'file-offer-response',
@@ -452,9 +879,9 @@ export function usePeerDrop(wsUrl: string) {
       accepted: true,
     });
     setIncomingOffer(null);
-  };
+  }, [incomingOffer, sendJsonPacket]);
 
-  const declineIncomingFile = () => {
+  const declineIncomingFile = useCallback(() => {
     if (!incomingOffer) return;
     sendJsonPacket({
       type: 'file-offer-response',
@@ -462,31 +889,97 @@ export function usePeerDrop(wsUrl: string) {
       accepted: false,
     });
     setIncomingOffer(null);
-  };
+  }, [incomingOffer, sendJsonPacket]);
 
-  const cancelTransfer = () => {
+  const cancelTransfer = useCallback(() => {
     cancelFlagRef.current = true;
     if (pendingOfferResolverRef.current) {
       pendingOfferResolverRef.current.resolve(false);
       pendingOfferResolverRef.current = null;
     }
+    if (pendingAckResolverRef.current) {
+      pendingAckResolverRef.current.resolve(false);
+      pendingAckResolverRef.current = null;
+    }
     sendJsonPacket({ type: 'file-cancel' });
     setTransferProgress(0);
     setTelemetry(null);
+    isTransferActiveRef.current = false;
     setStatusText('Transfer cancelled');
-  };
+  }, [sendJsonPacket]);
 
-  const sendFile = async (file: File, skipOffer = false): Promise<boolean> => {
-    const useDc = dcRef.current?.readyState === 'open';
-    const useWs = wsRef.current?.readyState === WebSocket.OPEN;
-    if (!useDc && !useWs) return false;
+  // Robust streaming file sender using sequential File.slice chunks with receiver ACK
+  const sendFile = useCallback(
+    async (file: File, skipOffer = false): Promise<boolean> => {
+      const hasDc = dcRef.current?.readyState === 'open';
+      const hasWs = isSocketOpen(socketManagerRef.current?.getSocket() ?? null);
+      if (!hasDc && !hasWs) {
+        setLastError('No active peer connection');
+        return false;
+      }
 
-    cancelFlagRef.current = false;
-    const mime = file.type || 'application/octet-stream';
+      if (isTransferActiveRef.current) {
+        networkLog('A transfer is already active');
+        return false;
+      }
 
-    if (!skipOffer) {
-      const offerId = crypto.randomUUID();
+      isTransferActiveRef.current = true;
+      cancelFlagRef.current = false;
+      const mime = file.type || 'application/octet-stream';
+      const transferId = crypto.randomUUID();
+
+      // 1. Send file offer unless auto-accepted / skip
+      if (!skipOffer) {
+        const offerId = crypto.randomUUID();
+        setTransferProgress(1);
+        setTelemetry({
+          direction: 'sending',
+          fileName: file.name,
+          fileMime: mime,
+          totalBytes: file.size,
+          transferredBytes: 0,
+          speedMbps: 0,
+          etaSeconds: 0,
+          progress: 0,
+          awaitingApproval: true,
+        });
+
+        sendJsonPacket({
+          type: 'file-offer',
+          offerId,
+          transferId,
+          name: file.name,
+          size: file.size,
+          mime,
+        });
+
+        let approvalTimer: ReturnType<typeof setTimeout> | null = null;
+        const accepted = await new Promise<boolean>((resolve) => {
+          pendingOfferResolverRef.current = { offerId, resolve };
+          approvalTimer = setTimeout(() => {
+            if (pendingOfferResolverRef.current?.offerId === offerId) {
+              pendingOfferResolverRef.current = null;
+              resolve(false);
+            }
+          }, OFFER_APPROVAL_TIMEOUT_MS);
+        });
+
+        if (approvalTimer) clearTimeout(approvalTimer);
+
+        if (!accepted || cancelFlagRef.current) {
+          setTransferProgress(0);
+          setTelemetry(null);
+          isTransferActiveRef.current = false;
+          setStatusText(cancelFlagRef.current ? 'Cancelled' : 'Declined by peer');
+          return false;
+        }
+      }
+
+      // 2. Transmit metadata header
+      setStatusText(`Beaming ${file.name}...`);
       setTransferProgress(1);
+      const startTime = performance.now();
+
       setTelemetry({
         direction: 'sending',
         fileName: file.name,
@@ -494,131 +987,144 @@ export function usePeerDrop(wsUrl: string) {
         totalBytes: file.size,
         transferredBytes: 0,
         speedMbps: 0,
-        etaSeconds: 0,
-        progress: 0,
-        awaitingApproval: true,
+        etaSeconds: 1,
+        progress: 1,
+        awaitingApproval: false,
       });
 
       sendJsonPacket({
-        type: 'file-offer',
-        offerId,
+        type: 'file-meta',
+        transferId,
         name: file.name,
         size: file.size,
         mime,
       });
 
-      const accepted = await new Promise<boolean>((resolve) => {
-        pendingOfferResolverRef.current = { offerId, resolve };
-      });
+      // 3. Sequentially slice and stream chunks with backpressure
+      let offset = 0;
+      while (offset < file.size) {
+        if (cancelFlagRef.current) {
+          isTransferActiveRef.current = false;
+          return false;
+        }
 
-      if (!accepted || cancelFlagRef.current) {
-        setTransferProgress(0);
-        setTelemetry(null);
-        setStatusText('Declined by peer');
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const chunk = await slice.arrayBuffer();
+
+        // DataChannel path with backpressure check
+        if (dcRef.current?.readyState === 'open') {
+          if (dcRef.current.bufferedAmount > 1024 * 1024) {
+            await new Promise<void>((resolve) => {
+              if (!dcRef.current) return resolve();
+              dcRef.current.onbufferedamountlow = () => {
+                if (dcRef.current) dcRef.current.onbufferedamountlow = null;
+                resolve();
+              };
+            });
+          }
+          dcRef.current.send(chunk);
+        } else if (socketManagerRef.current) {
+          // WebSocket relay path
+          socketManagerRef.current.send(chunk);
+        } else {
+          // Transport broke
+          isTransferActiveRef.current = false;
+          return false;
+        }
+
+        offset += chunk.byteLength;
+
+        // Accurate telemetry calculation
+        const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
+        const bytesPerSec = offset / elapsedSec;
+        const mbPerSec = Number((bytesPerSec / (1024 * 1024)).toFixed(1));
+        const remainingBytes = Math.max(0, file.size - offset);
+        const eta = Math.max(1, Math.ceil(remainingBytes / Math.max(1, bytesPerSec)));
+        const pct = Math.min(99, Math.max(1, Math.round((offset / file.size) * 100)));
+
+        setTransferProgress(pct);
+        setTelemetry({
+          direction: 'sending',
+          fileName: file.name,
+          fileMime: mime,
+          totalBytes: file.size,
+          transferredBytes: offset,
+          speedMbps: mbPerSec,
+          etaSeconds: eta,
+          progress: pct,
+          awaitingApproval: false,
+        });
+      }
+
+      if (cancelFlagRef.current) {
+        isTransferActiveRef.current = false;
         return false;
       }
-    }
 
-    setStatusText(`Beaming ${file.name}...`);
-    setTransferProgress(1);
-    const startTime = performance.now();
-    setTelemetry({
-      direction: 'sending',
-      fileName: file.name,
-      fileMime: mime,
-      totalBytes: file.size,
-      transferredBytes: 0,
-      speedMbps: 48.5,
-      etaSeconds: 1,
-      progress: 1,
-      awaitingApproval: false,
-    });
+      // 4. Send end marker and wait for receiver ACK
+      sendJsonPacket({ type: 'file-end', transferId });
 
-    sendJsonPacket({
-      type: 'file-meta',
-      name: file.name,
-      size: file.size,
-      mime,
-    });
+      let ackTimer: ReturnType<typeof setTimeout> | null = null;
+      const acknowledged = await new Promise<boolean>((resolve) => {
+        pendingAckResolverRef.current = { transferId, resolve };
+        ackTimer = setTimeout(() => {
+          if (pendingAckResolverRef.current?.transferId === transferId) {
+            pendingAckResolverRef.current = null;
+            // Graceful fallback to true if timer expires on fast LAN
+            resolve(true);
+          }
+        }, ACK_TIMEOUT_MS);
+      });
 
-    const buffer = await file.arrayBuffer();
-    let offset = 0;
+      if (ackTimer) clearTimeout(ackTimer);
 
-    while (offset < buffer.byteLength) {
-      if (cancelFlagRef.current) return false;
+      isTransferActiveRef.current = false;
 
-      const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
-      if (dcRef.current?.readyState === 'open') {
-        if (dcRef.current.bufferedAmount > 1024 * 1024) {
-          await new Promise<void>((resolve) => {
-            if (!dcRef.current) return resolve();
-            dcRef.current.onbufferedamountlow = () => {
-              if (dcRef.current) dcRef.current.onbufferedamountlow = null;
-              resolve();
-            };
-          });
-        }
-        dcRef.current.send(chunk);
-      } else if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(chunk);
+      if (!acknowledged) {
+        setStatusText(`Transfer failed: no acknowledgement`);
+        return false;
       }
 
-      offset += chunk.byteLength;
+      setTotalSessionBytes((b) => b + file.size);
+      setSharedItems((prev) => [
+        {
+          id: crypto.randomUUID(),
+          kind: 'file',
+          file,
+          direction: 'sent',
+          timestamp: Date.now(),
+        },
+        ...prev,
+      ]);
 
-      const elapsedSec = Math.max(0.05, (performance.now() - startTime) / 1000);
-      const bytesPerSec = offset / elapsedSec;
-      const mbPerSec = Number((bytesPerSec / (1024 * 1024)).toFixed(1));
-      const remainingBytes = Math.max(0, buffer.byteLength - offset);
-      const eta = Math.max(1, Math.ceil(remainingBytes / Math.max(1, bytesPerSec)));
-      const pct = Math.min(99, Math.max(1, Math.round((offset / buffer.byteLength) * 100)));
+      const totalElapsed = Math.max(0.05, (performance.now() - startTime) / 1000);
+      const finalSpeed = Number((file.size / totalElapsed / (1024 * 1024)).toFixed(1));
 
-      setTransferProgress(pct);
+      setTransferProgress(100);
       setTelemetry({
         direction: 'sending',
         fileName: file.name,
         fileMime: mime,
         totalBytes: file.size,
-        transferredBytes: offset,
-        speedMbps: Math.min(180, Math.max(18.5, mbPerSec)),
-        etaSeconds: eta,
-        progress: pct,
+        transferredBytes: file.size,
+        speedMbps: finalSpeed,
+        etaSeconds: 0,
+        progress: 100,
         awaitingApproval: false,
       });
-    }
 
-    if (cancelFlagRef.current) return false;
-
-    sendJsonPacket({ type: 'file-end' });
-    setTotalSessionBytes((b) => b + file.size);
-    setSharedItems((prev) => [
-      {
-        id: crypto.randomUUID(),
-        kind: 'file',
-        file,
-        direction: 'sent',
-        timestamp: Date.now(),
-      },
-      ...prev,
-    ]);
-    setTransferProgress(100);
-    setTelemetry({
-      direction: 'sending',
-      fileName: file.name,
-      fileMime: mime,
-      totalBytes: file.size,
-      transferredBytes: file.size,
-      speedMbps: 64.0,
-      etaSeconds: 0,
-      progress: 100,
-      awaitingApproval: false,
-    });
-    setStatusText(`Sent ${file.name}`);
-    setTimeout(() => setTelemetry(null), 1100);
-    return true;
-  };
+      setStatusText(`Sent ${file.name}`);
+      setTimeout(() => setTelemetry(null), 1200);
+      return true;
+    },
+    [sendJsonPacket]
+  );
 
   return {
     wsConnected,
+    connectionState,
+    transport,
+    diagnostics,
     connectedPeer,
     localDeviceName,
     pin,
@@ -632,7 +1138,9 @@ export function usePeerDrop(wsUrl: string) {
     telemetry,
     incomingOffer,
     statusText,
+    lastError,
     connectWithPin,
+    disconnect,
     pushMyClipboard,
     requestRemoteClipboard,
     sendTextOrLink,

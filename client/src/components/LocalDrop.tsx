@@ -24,6 +24,7 @@ import {
   History,
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
+import type { ConnectionState, TransportType } from '../types/network';
 import { springs } from '../motion-presets';
 import { LocalDropHeader, LocalDropFooter } from './LocalDropChrome';
 import { Handshake, FileStack, TransferMotion, type StagedFile } from './LocalDropMotion';
@@ -63,6 +64,8 @@ export type Props = {
   onVoiceNote?: (file: File) => void;
   connecting?: boolean;
   error?: string;
+  connectionState?: ConnectionState;
+  transport?: TransportType;
   // Diagnostics & Session extras
   wsConnected: boolean;
   autoAccept: boolean;
@@ -240,9 +243,21 @@ export default function LocalDrop(p: Props) {
         <LocalDropHeader
           deviceName={p.device}
           peerName={p.peer}
-          state={p.peer ? 'connected' : p.connecting ? 'connecting' : 'offline'}
-          secure={Boolean(p.peer && p.wsConnected)}
-          transportLabel="WebRTC"
+          state={
+            p.connectionState === 'direct' || p.connectionState === 'relayed' || Boolean(p.peer)
+              ? 'connected'
+              : p.connectionState === 'offline'
+                ? 'offline'
+                : 'connecting'
+          }
+          secure={p.transport === 'webrtc'}
+          transportLabel={
+            p.transport === 'webrtc'
+              ? 'Direct WebRTC'
+              : p.transport === 'websocket'
+                ? 'WebSocket Relay'
+                : 'WebRTC'
+          }
           dark={dark}
           onToggleTheme={() => setDark(!dark)}
           onSettings={() => {

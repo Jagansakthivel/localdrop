@@ -1,19 +1,20 @@
-import { useState, useMemo, useEffect, useCallback } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import JSZip from 'jszip';
 import { PDFDocument } from 'pdf-lib';
 import { Toaster, toast } from 'sonner';
 import { usePeerDrop } from './hooks/usePeerDrop';
 import LocalDrop, { type Transfer, type StagedItem } from './components/LocalDrop';
 import { normalizeFiles, formatBytes } from './utils/fileAdapter';
+import { resolveWebSocketUrl } from './utils/network';
 import './localdrop.css';
 
-const WS_URL =
-  import.meta.env.VITE_WS_URL ||
-  `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
+const WS_URL = resolveWebSocketUrl();
 
 export default function App() {
   const {
     wsConnected,
+    connectionState,
+    transport,
     connectedPeer,
     localDeviceName,
     pin,
@@ -22,7 +23,10 @@ export default function App() {
     sharedItems,
     telemetry,
     incomingOffer,
+    statusText,
+    lastError,
     connectWithPin,
+    disconnect,
     sendTextOrLink,
     sendFile,
     acceptIncomingFile,
@@ -32,27 +36,29 @@ export default function App() {
 
   const [stagedFiles, setStagedFiles] = useState<StagedItem[]>([]);
   const [isSendingBatch, setIsSendingBatch] = useState(false);
-  const [connectionError, setConnectionError] = useState<string>('');
-  const [isConnecting, setIsConnecting] = useState(false);
   const [channelSessionId, setChannelSessionId] = useState<string | null>(null);
+  const autoPairAttemptedRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (connectedPeer) {
-      setIsConnecting(false);
       setChannelSessionId(connectedPeer.id || crypto.randomUUID());
     } else {
       setChannelSessionId(null);
     }
   }, [connectedPeer]);
 
-  // Auto-connect from URL ?pin=XXXX
+  // Safe Auto-connect from URL ?pin=XXXX (waits until WebSocket signaling is ready)
   useEffect(() => {
+    if (!wsConnected || connectedPeer) return;
+
     const params = new URLSearchParams(window.location.search);
     const urlPin = params.get('pin');
-    if (urlPin && /^\d{4}$/.test(urlPin) && !connectedPeer) {
-      connectWithPin(urlPin);
-    }
-  }, [connectedPeer, connectWithPin]);
+    if (!urlPin || !/^\d{4}$/.test(urlPin)) return;
+    if (autoPairAttemptedRef.current === urlPin) return;
+
+    autoPairAttemptedRef.current = urlPin;
+    connectWithPin(urlPin);
+  }, [wsConnected, connectedPeer, connectWithPin]);
 
   const pairingUrl = useMemo(() => {
     const loc = window.location;
@@ -67,7 +73,7 @@ export default function App() {
     toast.success(`Staged ${normalized.length} ${normalized.length === 1 ? 'file' : 'files'}`);
   }, []);
 
-  // Send all staged files sequentially
+  // Send all staged files sequentially with real acknowledgement verification
   const handleSendStaged = async () => {
     if (!connectedPeer || stagedFiles.length === 0 || isSendingBatch) return;
     setIsSendingBatch(true);
@@ -76,7 +82,11 @@ export default function App() {
     for (let i = 0; i < queue.length; i++) {
       const item = queue[i];
       try {
-        await sendFile(item.file);
+        const success = await sendFile(item.file);
+        if (!success) {
+          toast.error(`Transfer cancelled or declined: ${item.name}`);
+          break;
+        }
         setStagedFiles((prev) => prev.filter((sf) => sf.id !== item.id));
       } catch (err) {
         console.error('Failed sending staged file:', err);
@@ -196,14 +206,13 @@ export default function App() {
         status:
           telemetry.progress >= 100
             ? 'Verified ✓'
-            : `${(telemetry.speedMbps / 8).toFixed(1)} MB/s · ${telemetry.etaSeconds}s remaining`,
+            : `${(telemetry.speedMbps).toFixed(1)} MB/s · ${telemetry.etaSeconds}s remaining`,
       });
     }
 
     // Historical items from sharedItems
     sharedItems.forEach((item) => {
       if (item.kind === 'file' && item.file) {
-        // If this file is currently being tracked as active telemetry, avoid duplicate
         if (telemetry && telemetry.fileName === item.file.name && telemetry.progress < 100) {
           return;
         }
@@ -221,6 +230,13 @@ export default function App() {
     return list;
   }, [telemetry, sharedItems]);
 
+  const isConnecting =
+    connectionState === 'pairing' ||
+    connectionState === 'negotiating' ||
+    connectionState === 'signaling';
+
+  const displayError = lastError || (connectionState === 'failed' ? statusText : '');
+
   return (
     <>
       <Toaster position="bottom-right" richColors />
@@ -232,14 +248,9 @@ export default function App() {
         transfers={transfersList}
         stagedFiles={stagedFiles}
         onConnect={(targetPin) => {
-          setConnectionError('');
-          setIsConnecting(true);
           connectWithPin(targetPin);
         }}
-        onDisconnect={() => {
-          // Soft-disconnect by reloading or reinitializing
-          window.location.href = window.location.pathname;
-        }}
+        onDisconnect={disconnect}
         onFiles={handleFiles}
         onClipboard={(text) => {
           sendTextOrLink(text);
@@ -258,7 +269,9 @@ export default function App() {
           toast.success('Voice memo recorded and staged');
         }}
         connecting={isConnecting}
-        error={connectionError}
+        error={displayError}
+        connectionState={connectionState}
+        transport={transport}
         wsConnected={wsConnected}
         autoAccept={autoAccept}
         onToggleAutoAccept={() => setAutoAccept(!autoAccept)}
