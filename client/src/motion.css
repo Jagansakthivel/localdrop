@@ -12,11 +12,60 @@
 [data-theme='dark'],
 .dark,
 .ld-dark {
-  --ld-paper: #222722;
-  --ld-ink: #f5f1e8;
-  --ld-accent: #ff987d;
-  --ld-sage: #354637;
-  --ld-line: #465047;
+  --ld-paper: #121319;
+  --ld-surface: #1b1d26;
+  --ld-elevated: #20222d;
+  --ld-secondary: #272a35;
+  --ld-ink: #f4f1f1;
+  --ld-muted: #acaabb;
+  --ld-line: #363846;
+  --ld-accent: #ff8b76;
+  --ld-accent-hover: #ff9e8d;
+  --ld-success: #76c7a7;
+  --ld-animation: #b7a4f4;
+  --ld-sage: #272a35;
+}
+
+.ld-dark .ld-handshake-sheet {
+  background: var(--ld-elevated);
+  border: 1px solid var(--ld-line);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+}
+
+.ld-dark .ld-device {
+  background: var(--ld-secondary);
+  color: var(--ld-animation);
+  box-shadow: 0 6px 0 color-mix(in oklab, var(--ld-secondary), black 20%);
+}
+
+.ld-dark .ld-device.ld-peer {
+  background: var(--ld-elevated);
+  color: var(--ld-accent);
+  box-shadow: 0 6px 0 color-mix(in oklab, var(--ld-elevated), black 20%);
+}
+
+.ld-dark .ld-bridge {
+  color: var(--ld-animation);
+}
+
+.ld-dark .ld-paper {
+  background: var(--ld-surface);
+  border-color: var(--ld-line);
+  box-shadow: 0 5px 12px rgba(0, 0, 0, 0.35);
+}
+
+.ld-dark .ld-transfer-art {
+  background: var(--ld-surface);
+  border-color: var(--ld-line);
+}
+
+.ld-dark .ld-in .ld-transfer-art {
+  background: var(--ld-surface);
+  color: var(--ld-success);
+}
+
+.ld-dark .ld-in .ld-progress div {
+  background: var(--ld-success);
 }
 
 .ld-number,
@@ -251,6 +300,20 @@
   align-items: center;
   border-top: 1px solid var(--ld-line);
   padding: 18px 0;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.ld-transfer-copy {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .ld-transfer-art {
@@ -259,6 +322,8 @@
   border-radius: 14px;
   border: 1px solid color-mix(in oklab, var(--ld-line) 60%, transparent);
   overflow: hidden;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .ld-in .ld-transfer-art {
@@ -271,25 +336,35 @@
   display: block;
 }
 
-.ld-transfer h3 {
+.ld-transfer h3,
+.ld-transfer-copy h3 {
   font-size: 15px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  display: block;
   margin: 8px 0 14px;
 }
 
 .ld-progress {
+  position: relative;
   height: 4px;
   background: var(--ld-line);
   border-radius: 4px;
   overflow: hidden;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .ld-progress div {
   height: 100%;
-  background: var(--ld-accent);
+  max-width: 100%;
+  background: var(--accent);
   transform-origin: left;
 }
 
@@ -300,10 +375,18 @@
 .ld-metrics {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
   font-size: 13px;
   color: color-mix(in oklab, var(--ld-ink) 75%, transparent);
+  width: 100%;
+  min-width: 0;
+}
+
+.ld-metrics > * {
+  min-width: 0;
 }
 
 .ld-handshake button:focus-visible,
@@ -314,11 +397,16 @@
 
 @media (max-width: 480px) {
   .ld-transfer {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 10px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
   }
   .ld-transfer-art {
     max-width: 220px;
+    margin: 0 auto;
+    width: 100%;
   }
   .ld-handshake-sheet {
     padding: 24px;

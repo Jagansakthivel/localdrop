@@ -9,6 +9,9 @@ dist/
 dist-ssr/
 *.tsbuildinfo
 server/index.js
+server/test-connection.js
+.wrangler/
+.wrangler
 
 # Environment variables
 .env

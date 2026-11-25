@@ -1,5 +1,6 @@
 import { useEffect, useId, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
+import { formatFilename } from '../utils/formatFilename';
 import '../motion.css';
 
 const spring = { type: 'spring', stiffness: 240, damping: 24, mass: 0.85 } as const;
@@ -253,7 +254,7 @@ export function FileStack({
             >
               {validFiles.map((f) => (
                 <div key={f.id} className="ld-file-row">
-                  <span>{f.name || 'Unnamed file'}</span>
+                  <span title={f.name}>{formatFilename(f.name || 'Unnamed file', 36)}</span>
                   <small>{f.sizeLabel}</small>
                   <button onClick={() => onRemove(f.id)} aria-label={`Remove ${f.name}`}>
                     ×
@@ -268,7 +269,13 @@ export function FileStack({
   );
 }
 
-export function TransferMotion({ transfer: t }: { transfer: MotionTransfer }) {
+export function TransferMotion({
+  transfer: t,
+  children,
+}: {
+  transfer: MotionTransfer;
+  children?: React.ReactNode;
+}) {
   const reduced = useReducedMotion();
   const rawClip = useId();
   const clip = `clip-${rawClip.replace(/:/g, '')}`;
@@ -279,14 +286,15 @@ export function TransferMotion({ transfer: t }: { transfer: MotionTransfer }) {
   const sending = t.direction === 'send';
   const active = t.status === 'active';
   const done = t.status === 'complete';
+  const displayName = formatFilename(t.name || 'File', 44);
 
   return (
     <motion.article
-      className={`ld-transfer ${sending ? 'ld-out' : 'ld-in'}`}
+      className={`ld-transfer ld-transfer-card ${sending ? 'ld-out' : 'ld-in'}`}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
     >
-      <div className="ld-transfer-art" aria-hidden="true">
+      <div className="ld-transfer-art ld-transfer-animation" aria-hidden="true">
         <svg viewBox="0 0 320 120">
           <defs>
             <clipPath id={clip}>
@@ -381,8 +389,8 @@ export function TransferMotion({ transfer: t }: { transfer: MotionTransfer }) {
           </g>
         </svg>
       </div>
-      <div className="ld-transfer-copy">
-        <div className="ld-kicker">
+      <div className="ld-transfer-copy ld-transfer-content ld-transfer-info">
+        <div className="ld-kicker ld-transfer-status">
           {done
             ? sending
               ? 'SENT'
@@ -393,25 +401,33 @@ export function TransferMotion({ transfer: t }: { transfer: MotionTransfer }) {
                 : 'RECEIVING'
               : (t.status || 'READY').toUpperCase()}
         </div>
-        <h3 title={t.name}>{t.name || 'File'}</h3>
+        <h3
+          className="ld-transfer-name ld-transfer-filename"
+          title={t.name}
+          aria-label={t.name}
+        >
+          {displayName}
+        </h3>
         <div
-          className="ld-progress"
+          className="ld-progress ld-progress-track"
           role="progressbar"
           aria-label={`Transfer progress for ${t.name}`}
-          aria-valuenow={p}
+          aria-valuenow={Math.round(p)}
           aria-valuemin={0}
           aria-valuemax={100}
         >
           <motion.div
+            className="ld-progress-fill"
             initial={false}
             animate={{ scaleX: p / 100 }}
             transition={reduced ? { duration: 0 } : { duration: 0.2 }}
           />
         </div>
-        <div className="ld-metrics">
-          <span className="ld-number">{Math.floor(p)}%</span>
+        <div className="ld-metrics ld-transfer-meta">
+          <span className="ld-number">{Math.round(p)}%</span>
           <span>{active ? t.speedLabel : undefined}</span>
         </div>
+        {children}
       </div>
     </motion.article>
   );

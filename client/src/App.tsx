@@ -197,8 +197,15 @@ export default function App() {
 
     // If active transfer is underway
     if (telemetry) {
+      const matchingFile = sharedItems.find(
+        (item) =>
+          item.kind === 'file' &&
+          item.file &&
+          (telemetry.transferId ? item.id === telemetry.transferId : item.file.name === telemetry.fileName)
+      )?.file;
+
       list.push({
-        id: 'active-telemetry',
+        id: telemetry.transferId || 'active-telemetry',
         name: telemetry.fileName,
         size: formatBytes(telemetry.totalBytes),
         progress: telemetry.progress,
@@ -207,13 +214,19 @@ export default function App() {
           telemetry.progress >= 100
             ? 'Verified ✓'
             : `${(telemetry.speedMbps).toFixed(1)} MB/s · ${telemetry.etaSeconds}s remaining`,
+        file: matchingFile || null,
       });
     }
 
     // Historical items from sharedItems
     sharedItems.forEach((item) => {
       if (item.kind === 'file' && item.file) {
-        if (telemetry && telemetry.fileName === item.file.name && telemetry.progress < 100) {
+        if (
+          telemetry &&
+          (telemetry.transferId
+            ? telemetry.transferId === item.id
+            : telemetry.fileName === item.file.name)
+        ) {
           return;
         }
         list.push({
@@ -223,6 +236,7 @@ export default function App() {
           progress: 100,
           direction: item.direction === 'sent' ? 'send' : 'receive',
           status: 'Completed',
+          file: item.file,
         });
       }
     });

@@ -43,7 +43,7 @@ async function runTests() {
   console.log('✓ Device A connected, ID:', welcomeA.id);
 
   wsA.send(JSON.stringify({ type: 'register', name: 'MacBook Pro', deviceType: 'desktop' }));
-  const hostPin = '4821';
+  const hostPin = String(Math.floor(1000 + Math.random() * 9000));
   wsA.send(JSON.stringify({ type: 'create-room', roomCode: hostPin }));
   const createdA = await waitMessage(wsA, (m) => m.type === 'room-created');
   console.log('✓ Device A created room:', createdA.roomCode);
@@ -138,7 +138,19 @@ async function runTests() {
   // Clean up
   wsA.close();
   wsB.close();
-  console.log('\n✅ ALL 6 INTEGRATION TESTS PASSED CLEANLY!\n');
+
+  console.log('\n--- TEST 7: HTTP /health Endpoint & Render Zero-Downtime Check ---');
+  const healthRes = await fetch('http://localhost:8080/health');
+  if (!healthRes.ok) {
+    throw new Error(`/health returned HTTP status ${healthRes.status}`);
+  }
+  const healthData = await healthRes.json();
+  if (healthData.status !== 'ok') {
+    throw new Error(`/health payload status was ${healthData.status}, expected "ok"`);
+  }
+  console.log('✓ /health responded 200 OK with payload:', healthData);
+
+  console.log('\n✅ ALL 7 INTEGRATION TESTS PASSED CLEANLY!\n');
 }
 
 runTests().catch((err) => {

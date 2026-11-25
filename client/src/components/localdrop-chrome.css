@@ -351,6 +351,10 @@
   padding: 22px 16px 26px;
   border-top: 1px solid var(--ldx-border);
   color: var(--ldx-secondary);
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .ldx-footer-inner {
@@ -363,6 +367,8 @@
   gap: 7px;
   text-align: center;
   width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .ldx-footer p {

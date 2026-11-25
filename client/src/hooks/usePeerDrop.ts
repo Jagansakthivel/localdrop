@@ -3,7 +3,8 @@ import type { ConnectionState, TransportType, NetworkDiagnostics } from '../type
 import { createReconnectingSocket } from '../utils/reconnectingSocket';
 import { IceCandidateQueue } from '../utils/iceCandidateQueue';
 import { attachRtcDiagnostics } from '../utils/rtcDiagnostics';
-import { isSocketOpen, isValidPin, networkLog } from '../utils/network';
+import { isSocketOpen, isValidPin, networkLog, pingBackendHealth } from '../utils/network';
+import { createConnectionProfiler } from '../utils/connectionProfiler';
 
 export interface PeerInfo {
   id: string;
@@ -21,6 +22,7 @@ export interface ReceivedItem {
 }
 
 export interface TransferTelemetry {
+  transferId?: string;
   direction: 'sending' | 'receiving';
   fileName: string;
   fileMime: string;
@@ -38,6 +40,7 @@ export interface IncomingFileOffer {
   size: number;
   mime: string;
   fromName: string;
+  senderDeviceType?: 'mobile' | 'desktop';
 }
 
 const CHUNK_SIZE = 64 * 1024;
@@ -100,7 +103,7 @@ export function usePeerDrop(wsUrl: string) {
   const [transferProgress, setTransferProgress] = useState<number>(0);
   const [telemetry, setTelemetry] = useState<TransferTelemetry | null>(null);
   const [incomingOffer, setIncomingOffer] = useState<IncomingFileOffer | null>(null);
-  const [statusText, setStatusText] = useState<string>('Ready to pair');
+  const [statusText, setStatusText] = useState<string>('Starting LocalDrop server...');
 
   // Diagnostics tracking
   const [diagnostics, setDiagnostics] = useState<NetworkDiagnostics>({
@@ -132,6 +135,10 @@ export function usePeerDrop(wsUrl: string) {
   const cancelFlagRef = useRef<boolean>(false);
   const autoAcceptRef = useRef<boolean>(autoAccept);
   const isTransferActiveRef = useRef<boolean>(false);
+  const profilerRef = useRef<ReturnType<typeof createConnectionProfiler> | null>(null);
+  const negotiatingPeerIdRef = useRef<string | null>(null);
+  const relayReadyRef = useRef<boolean>(false);
+  const hasConnectedOnceRef = useRef<boolean>(false);
 
   useEffect(() => {
     autoAcceptRef.current = autoAccept;
@@ -250,11 +257,13 @@ export function usePeerDrop(wsUrl: string) {
     }
 
     iceQueueRef.current.clear();
+    negotiatingPeerIdRef.current = null;
   }, []);
 
   // Declare established connection
   const markConnected = useCallback(
     (mode: 'direct' | 'relayed', peer: PeerInfo) => {
+      negotiatingPeerIdRef.current = null;
       if (negotiationTimerRef.current) {
         clearTimeout(negotiationTimerRef.current);
         negotiationTimerRef.current = null;
@@ -275,6 +284,9 @@ export function usePeerDrop(wsUrl: string) {
           : `Relayed with ${peer.name} (Direct WebRTC unavailable)`
       );
       networkLog(`Connection established (${mode}) with`, peer.name);
+
+      profilerRef.current?.mark('UI connected');
+      profilerRef.current?.report();
     },
     []
   );
@@ -282,9 +294,16 @@ export function usePeerDrop(wsUrl: string) {
   // Fallback to WebSocket relay if direct WebRTC negotiation fails or stalls
   const fallbackToRelay = useCallback(() => {
     if (!targetPeerRef.current) return;
+    const socket = socketManagerRef.current?.getSocket();
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      networkLog('Cannot fall back to relay: socket not open');
+      return;
+    }
+    profilerRef.current?.mark('relay confirmed');
     networkLog('Falling back to WebSocket room relay');
+    sendJsonPacket({ type: 'transport-switch', transport: 'relayed' });
     markConnected('relayed', targetPeerRef.current);
-  }, [markConnected]);
+  }, [markConnected, sendJsonPacket]);
 
   // Handle incoming protocol messages (from DataChannel or WebSocket relay)
   const handleProtocolJson = useCallback(
@@ -328,6 +347,10 @@ export function usePeerDrop(wsUrl: string) {
             size: Number(msg.size),
             mime: String(msg.mime),
             fromName: targetPeerRef.current?.name || 'Peer',
+            senderDeviceType:
+              (msg.senderDeviceType as 'mobile' | 'desktop') ||
+              targetPeerRef.current?.deviceType ||
+              'desktop',
           });
         }
       } else if (msg.type === 'file-offer-response') {
@@ -337,8 +360,9 @@ export function usePeerDrop(wsUrl: string) {
           pendingOfferResolverRef.current = null;
         }
       } else if (msg.type === 'file-meta') {
+        const transferId = String(msg.transferId || crypto.randomUUID());
         incomingMetaRef.current = {
-          transferId: String(msg.transferId || crypto.randomUUID()),
+          transferId,
           name: String(msg.name),
           size: Number(msg.size),
           mime: String(msg.mime),
@@ -348,6 +372,7 @@ export function usePeerDrop(wsUrl: string) {
         transferStartRef.current = performance.now();
         setTransferProgress(1);
         setTelemetry({
+          transferId,
           direction: 'receiving',
           fileName: String(msg.name),
           fileMime: String(msg.mime),
@@ -381,7 +406,7 @@ export function usePeerDrop(wsUrl: string) {
         setTotalSessionBytes((b) => b + meta.size);
         setSharedItems((prev) => [
           {
-            id: crypto.randomUUID(),
+            id: meta.transferId || crypto.randomUUID(),
             kind: 'file',
             file,
             direction: 'received',
@@ -410,9 +435,24 @@ export function usePeerDrop(wsUrl: string) {
           resolver.resolve(true);
           pendingAckResolverRef.current = null;
         }
+      } else if (msg.type === 'relay-ping') {
+        sendJsonPacket({
+          type: 'relay-pong',
+          from: myIdRef.current,
+          sessionId: sessionIdRef.current,
+        });
+      } else if (msg.type === 'relay-pong') {
+        relayReadyRef.current = true;
+        profilerRef.current?.mark('relay confirmed');
+        networkLog('Relay path confirmed concurrently with direct negotiation');
+      } else if (msg.type === 'transport-switch') {
+        if (msg.transport === 'relayed' && targetPeerRef.current) {
+          profilerRef.current?.mark('relay confirmed');
+          markConnected('relayed', targetPeerRef.current);
+        }
       }
     },
-    [sendJsonPacket]
+    [sendJsonPacket, markConnected]
   );
 
   // Handle incoming binary chunk
@@ -433,6 +473,7 @@ export function usePeerDrop(wsUrl: string) {
 
       setTransferProgress(pct);
       setTelemetry({
+        transferId: incomingMetaRef.current.transferId,
         direction: 'receiving',
         fileName: incomingMetaRef.current.name,
         fileMime: incomingMetaRef.current.mime,
@@ -454,6 +495,7 @@ export function usePeerDrop(wsUrl: string) {
 
       channel.onopen = () => {
         if (dcRef.current !== channel) return;
+        profilerRef.current?.mark('channel open');
         markConnected('direct', peer);
       };
 
@@ -504,6 +546,7 @@ export function usePeerDrop(wsUrl: string) {
 
       pc.onicecandidate = (e) => {
         if (e.candidate && myIdRef.current) {
+          profilerRef.current?.mark('first ICE candidate');
           sendSignal(peer.id, { candidate: e.candidate });
         }
       };
@@ -513,14 +556,19 @@ export function usePeerDrop(wsUrl: string) {
       };
 
       pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-          networkLog('ICE connection state:', pc.iceConnectionState);
+        networkLog('ICE connection state:', pc.iceConnectionState);
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          profilerRef.current?.mark('ICE connected');
+        } else if (pc.iceConnectionState === 'failed') {
           fallbackToRelay();
         }
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed') {
+        networkLog('PeerConnection connectionState:', pc.connectionState);
+        if (pc.connectionState === 'connected') {
+          profilerRef.current?.mark('ICE connected');
+        } else if (pc.connectionState === 'failed') {
           networkLog('PeerConnection failed, attempting relay');
           fallbackToRelay();
         }
@@ -534,6 +582,17 @@ export function usePeerDrop(wsUrl: string) {
   // Deterministic WebRTC negotiation: designated initiator starts offer
   const startNegotiation = useCallback(
     async (peer: PeerInfo, isInitiator: boolean) => {
+      // Guard against duplicate negotiation tearing down an in-flight PeerConnection
+      if (
+        pcRef.current &&
+        pcRef.current.signalingState !== 'closed' &&
+        negotiatingPeerIdRef.current === peer.id
+      ) {
+        networkLog(`Already negotiating with ${peer.name} (${peer.id}), skipping duplicate trigger`);
+        return;
+      }
+
+      negotiatingPeerIdRef.current = peer.id;
       setConnectionState('negotiating');
       setStatusText(`Establishing connection with ${peer.name}...`);
       targetPeerRef.current = peer;
@@ -542,6 +601,7 @@ export function usePeerDrop(wsUrl: string) {
       if (negotiationTimerRef.current) clearTimeout(negotiationTimerRef.current);
       negotiationTimerRef.current = setTimeout(() => {
         networkLog('WebRTC negotiation timed out, falling back to relay');
+        profilerRef.current?.report();
         fallbackToRelay();
       }, NEGOTIATION_TIMEOUT_MS);
 
@@ -554,6 +614,7 @@ export function usePeerDrop(wsUrl: string) {
 
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
+          profilerRef.current?.mark('offer sent');
           sendSignal(peer.id, { sdp: pc.localDescription });
         } catch (err) {
           networkLog('CreateOffer failed:', err);
@@ -568,8 +629,12 @@ export function usePeerDrop(wsUrl: string) {
   useEffect(() => {
     sessionIdRef.current = crypto.randomUUID();
 
+    // Send HTTP health check to wake up sleeping free-tier backends (Render cold start)
+    void pingBackendHealth(8000);
+
     const socketManager = createReconnectingSocket(wsUrl, {
       onOpen: (ws) => {
+        hasConnectedOnceRef.current = true;
         setWsConnected(true);
         setLastError(null);
         setConnectionState('waiting');
@@ -606,22 +671,35 @@ export function usePeerDrop(wsUrl: string) {
       onClose: () => {
         setWsConnected(false);
         setConnectionState('reconnecting');
-        setStatusText('Signaling disconnected, reconnecting...');
+        setStatusText(
+          hasConnectedOnceRef.current
+            ? 'Signaling disconnected, reconnecting...'
+            : 'Starting LocalDrop server...'
+        );
       },
 
       onError: () => {
-        setLastError('Signaling server connection error');
+        // Do not display misleading connection failure during normal free-tier cold start
+        if (hasConnectedOnceRef.current) {
+          setLastError('Signaling server connection error');
+        }
       },
 
       onReconnect: (attempt, delay) => {
-        setStatusText(`Reconnecting to signaling server (attempt ${attempt})...`);
+        if (!hasConnectedOnceRef.current) {
+          setStatusText('Starting LocalDrop server...');
+        } else {
+          setStatusText(`Reconnecting to server (attempt ${attempt})...`);
+        }
         networkLog(`Reconnecting attempt ${attempt} in ${delay}ms`);
       },
 
       onExhausted: () => {
         setConnectionState('offline');
         setStatusText('Signaling server unavailable');
-        setLastError('Unable to reach signaling server after multiple attempts');
+        setLastError(
+          'Unable to reach LocalDrop signaling server. Please check your internet connection or verify your signaling endpoint.'
+        );
       },
 
       onMessage: async (event) => {
@@ -642,10 +720,12 @@ export function usePeerDrop(wsUrl: string) {
           networkLog('Registered with signaling ID:', myIdRef.current);
         } else if (msg.type === 'room-created') {
           activeRoomRef.current = String(msg.roomCode);
+          profilerRef.current?.mark('room ack');
           setConnectionState('waiting');
           setStatusText('Ready to pair');
         } else if (msg.type === 'room-joined') {
           activeRoomRef.current = String(msg.roomCode);
+          profilerRef.current?.mark('room ack');
           pendingPinRef.current = null;
           if (pairingTimeoutTimerRef.current) {
             clearTimeout(pairingTimeoutTimerRef.current);
@@ -658,6 +738,7 @@ export function usePeerDrop(wsUrl: string) {
           setStatusText(errorMsg);
           setConnectionState('failed');
           pendingPinRef.current = null;
+          profilerRef.current?.report();
 
           if (pairingTimeoutTimerRef.current) {
             clearTimeout(pairingTimeoutTimerRef.current);
@@ -678,6 +759,25 @@ export function usePeerDrop(wsUrl: string) {
             const peer = peers[0];
             targetPeerRef.current = peer;
 
+            if (!profilerRef.current) {
+              profilerRef.current = createConnectionProfiler();
+            }
+            profilerRef.current.mark('peer discovery');
+
+            // Concurrently verify relay readiness
+            if (socketManagerRef.current) {
+              socketManagerRef.current.send(
+                JSON.stringify({
+                  type: 'relay',
+                  payload: {
+                    type: 'relay-ping',
+                    from: myIdRef.current,
+                    sessionId: sessionIdRef.current,
+                  },
+                })
+              );
+            }
+
             // Deterministic offer initiator: lexicographical UUID comparison
             const isInitiator = myIdRef.current < peer.id;
             networkLog(`Room paired with ${peer.name}. Is initiator: ${isInitiator}`);
@@ -697,6 +797,26 @@ export function usePeerDrop(wsUrl: string) {
           const peer = msg.peer as PeerInfo;
           if (peer && peer.id !== myIdRef.current) {
             targetPeerRef.current = peer;
+
+            if (!profilerRef.current) {
+              profilerRef.current = createConnectionProfiler();
+            }
+            profilerRef.current.mark('peer discovery');
+
+            // Concurrently verify relay readiness
+            if (socketManagerRef.current) {
+              socketManagerRef.current.send(
+                JSON.stringify({
+                  type: 'relay',
+                  payload: {
+                    type: 'relay-ping',
+                    from: myIdRef.current,
+                    sessionId: sessionIdRef.current,
+                  },
+                })
+              );
+            }
+
             const isInitiator = myIdRef.current < peer.id;
             startNegotiation(peer, isInitiator);
           }
@@ -728,6 +848,8 @@ export function usePeerDrop(wsUrl: string) {
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
                 sendSignal(sender.id, { sdp: pc.localDescription });
+              } else if (signal.sdp.type === 'answer') {
+                profilerRef.current?.mark('answer installed');
               }
             } catch (err) {
               networkLog('Error handling remote SDP signal:', err);
@@ -780,6 +902,9 @@ export function usePeerDrop(wsUrl: string) {
       setLastError(null);
       pendingPinRef.current = clean;
 
+      profilerRef.current = createConnectionProfiler();
+      profilerRef.current.mark('PIN submission');
+
       const socket = socketManagerRef.current?.getSocket();
       if (!socket || socket.readyState !== WebSocket.OPEN) {
         setConnectionState('signaling');
@@ -798,6 +923,7 @@ export function usePeerDrop(wsUrl: string) {
           setLastError(`Pairing to ${clean} timed out. Make sure the code is correct.`);
           setStatusText(`Pairing to ${clean} timed out`);
           pendingPinRef.current = null;
+          profilerRef.current?.report();
           // Restore host room
           socketManagerRef.current?.send(
             JSON.stringify({
@@ -933,6 +1059,7 @@ export function usePeerDrop(wsUrl: string) {
         const offerId = crypto.randomUUID();
         setTransferProgress(1);
         setTelemetry({
+          transferId,
           direction: 'sending',
           fileName: file.name,
           fileMime: mime,
@@ -951,6 +1078,7 @@ export function usePeerDrop(wsUrl: string) {
           name: file.name,
           size: file.size,
           mime,
+          senderDeviceType: detectDevice().deviceType,
         });
 
         let approvalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -981,6 +1109,7 @@ export function usePeerDrop(wsUrl: string) {
       const startTime = performance.now();
 
       setTelemetry({
+        transferId,
         direction: 'sending',
         fileName: file.name,
         fileMime: mime,
@@ -1000,6 +1129,9 @@ export function usePeerDrop(wsUrl: string) {
         mime,
       });
 
+      // Select one transport per transfer, do not switch mid-transfer
+      const transferTransport = dcRef.current?.readyState === 'open' ? 'direct' : 'relayed';
+
       // 3. Sequentially slice and stream chunks with backpressure
       let offset = 0;
       while (offset < file.size) {
@@ -1011,8 +1143,13 @@ export function usePeerDrop(wsUrl: string) {
         const slice = file.slice(offset, offset + CHUNK_SIZE);
         const chunk = await slice.arrayBuffer();
 
-        // DataChannel path with backpressure check
-        if (dcRef.current?.readyState === 'open') {
+        // Send exclusively using the pinned transport
+        if (transferTransport === 'direct') {
+          if (dcRef.current?.readyState !== 'open') {
+            isTransferActiveRef.current = false;
+            setStatusText('Transfer failed: direct connection interrupted');
+            return false;
+          }
           if (dcRef.current.bufferedAmount > 1024 * 1024) {
             await new Promise<void>((resolve) => {
               if (!dcRef.current) return resolve();
@@ -1023,13 +1160,15 @@ export function usePeerDrop(wsUrl: string) {
             });
           }
           dcRef.current.send(chunk);
-        } else if (socketManagerRef.current) {
-          // WebSocket relay path
-          socketManagerRef.current.send(chunk);
         } else {
-          // Transport broke
-          isTransferActiveRef.current = false;
-          return false;
+          const sm = socketManagerRef.current;
+          const socket = sm?.getSocket();
+          if (!sm || !socket || socket.readyState !== WebSocket.OPEN) {
+            isTransferActiveRef.current = false;
+            setStatusText('Transfer failed: relay connection interrupted');
+            return false;
+          }
+          sm.send(chunk);
         }
 
         offset += chunk.byteLength;
@@ -1044,6 +1183,7 @@ export function usePeerDrop(wsUrl: string) {
 
         setTransferProgress(pct);
         setTelemetry({
+          transferId,
           direction: 'sending',
           fileName: file.name,
           fileMime: mime,
@@ -1088,7 +1228,7 @@ export function usePeerDrop(wsUrl: string) {
       setTotalSessionBytes((b) => b + file.size);
       setSharedItems((prev) => [
         {
-          id: crypto.randomUUID(),
+          id: transferId || crypto.randomUUID(),
           kind: 'file',
           file,
           direction: 'sent',
@@ -1102,6 +1242,7 @@ export function usePeerDrop(wsUrl: string) {
 
       setTransferProgress(100);
       setTelemetry({
+        transferId,
         direction: 'sending',
         fileName: file.name,
         fileMime: mime,

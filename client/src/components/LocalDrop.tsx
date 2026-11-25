@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence, MotionConfig, useReducedMotion } from 'motion/react';
+import { formatFilename } from '../utils/formatFilename';
 import {
   ArrowUpRight,
   ArrowDownLeft,
@@ -30,6 +31,9 @@ import { LocalDropHeader, LocalDropFooter } from './LocalDropChrome';
 import { Handshake, FileStack, TransferMotion, type StagedFile } from './LocalDropMotion';
 import { MotionErrorBoundary } from './MotionErrorBoundary';
 import { normalizeFiles, useSafeThumbnails, formatBytes, type NormalizedFile } from '../utils/fileAdapter';
+import { ReceivedFileSave, type SaveState } from './ReceivedFileSave';
+import { IncomingTransferPopup, type IncomingTransferOffer } from './IncomingTransferPopup';
+import type { SaveFileHandle } from '../utils/saveReceivedFile';
 import '../localdrop.css';
 
 export type Transfer = {
@@ -39,6 +43,7 @@ export type Transfer = {
   progress: number;
   direction: 'send' | 'receive';
   status: string;
+  file?: File | null;
 };
 
 export type StagedItem = NormalizedFile;
@@ -83,7 +88,9 @@ export type Props = {
     offerId: string;
     name: string;
     size: number;
+    mime?: string;
     fromName: string;
+    senderDeviceType?: 'mobile' | 'desktop';
   } | null;
   onAcceptOffer: () => void;
   onDeclineOffer: () => void;
@@ -116,14 +123,20 @@ function StandardFileList({
       <div className="max-h-48 overflow-y-auto">
         {files.map((sf) => (
           <div key={sf.id} className="ld-staged-card">
-            <span className="text-xs font-medium truncate max-w-[200px]">{sf.name}</span>
-            <span className="text-[11px] text-[var(--muted)]">{sf.sizeLabel}</span>
+            <span
+              className="text-xs font-medium truncate flex-1 min-w-0"
+              title={sf.name}
+              aria-label={sf.name}
+            >
+              {formatFilename(sf.name, 36)}
+            </span>
+            <span className="text-[11px] text-[var(--muted)] flex-shrink-0">{sf.sizeLabel}</span>
             {onRemove && (
               <button
                 type="button"
                 onClick={() => onRemove(sf.id)}
-                className="text-[var(--muted)] hover:text-[var(--accent)]"
-                aria-label="Remove file"
+                className="text-[var(--muted)] hover:text-[var(--accent)] flex-shrink-0 min-h-[32px] min-w-[32px]"
+                aria-label={`Remove ${sf.name}`}
               >
                 ×
               </button>
@@ -149,6 +162,25 @@ export default function LocalDrop(p: Props) {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [recordingVoice, setRecordingVoice] = useState(false);
   const [voiceElapsed, setVoiceElapsed] = useState(0);
+  const [saveHandles, setSaveHandles] = useState<Record<string, SaveFileHandle>>({});
+  const [saveStates, setSaveStates] = useState<Record<string, { state: SaveState; filename: string }>>({});
+
+  const getSaveHandle = (t: Transfer) => saveHandles[t.id] || saveHandles[t.name] || null;
+  const setSaveHandle = (t: Transfer, handle: SaveFileHandle) => {
+    setSaveHandles((prev) => ({
+      ...prev,
+      [t.id]: handle,
+      [t.name]: handle,
+    }));
+  };
+  const getSaveState = (t: Transfer) => saveStates[t.id] || saveStates[t.name];
+  const setSaveStateRecord = (t: Transfer, state: SaveState, savedName: string) => {
+    setSaveStates((prev) => ({
+      ...prev,
+      [t.id]: { state, filename: savedName },
+      [t.name]: { state, filename: savedName },
+    }));
+  };
 
   const input = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
@@ -227,9 +259,36 @@ export default function LocalDrop(p: Props) {
     }
   };
 
+  const isReceiverMobile =
+    p.device.toLowerCase().includes('phone') ||
+    p.device.toLowerCase().includes('android') ||
+    p.device.toLowerCase().includes('iphone');
+
+  const popupOffer: IncomingTransferOffer | null = useMemo(() => {
+    if (!p.incomingOffer) return null;
+    return {
+      id: p.incomingOffer.offerId,
+      senderName: p.incomingOffer.fromName,
+      filename: p.incomingOffer.name,
+      size: p.incomingOffer.size,
+      mime: p.incomingOffer.mime,
+      senderDeviceType:
+        p.incomingOffer.senderDeviceType || (p.peerIsPhone ? 'mobile' : 'desktop'),
+      receiverDeviceType: isReceiverMobile ? 'mobile' : 'desktop',
+    };
+  }, [p.incomingOffer, p.peerIsPhone, isReceiverMobile]);
+
   return (
     <MotionConfig reducedMotion="user" transition={springs.smooth}>
       <div className={'ld ' + (dark ? 'ld-dark' : '')}>
+        {/* AirDrop-Style Premium Animated Incoming Transfer Popup */}
+        <IncomingTransferPopup
+          offer={popupOffer}
+          onAccept={p.onAcceptOffer}
+          onDecline={p.onDeclineOffer}
+          receiverDeviceType={isReceiverMobile ? 'mobile' : 'desktop'}
+        />
+
         {/* Persistent Magnetic Handshake Sequence with Error Boundary */}
         <MotionErrorBoundary name="Handshake">
           <Handshake
@@ -269,46 +328,6 @@ export default function LocalDrop(p: Props) {
 
         {/* Main Application Area */}
         <main id="localdrop" className="ld-main">
-          {/* Incoming Transfer Authorization Banner */}
-          <AnimatePresence>
-            {p.incomingOffer && (
-              <motion.div
-                initial={{ opacity: 0, y: -20, scale: 0.96 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: -10, scale: 0.96 }}
-                className="mb-6 p-5 rounded-2xl bg-[var(--surface)] border-2 border-[var(--accent)] shadow-xl flex flex-col sm:flex-row items-center justify-between gap-4"
-              >
-                <div>
-                  <div className="text-xs font-bold text-[var(--accent)] uppercase tracking-wider mb-1">
-                    Incoming Transfer Request
-                  </div>
-                  <div className="text-sm font-semibold text-[var(--ink)]">
-                    {p.incomingOffer.fromName} wants to send{' '}
-                    <span className="underline">{p.incomingOffer.name}</span> (
-                    {formatBytes(p.incomingOffer.size)})
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-3 w-full sm:w-auto">
-                  <button
-                    type="button"
-                    onClick={p.onDeclineOffer}
-                    className="flex-1 sm:flex-none px-4 py-2 text-xs font-semibold rounded-xl border border-[var(--line)] hover:bg-[var(--line)] transition"
-                  >
-                    Decline
-                  </button>
-                  <button
-                    type="button"
-                    onClick={p.onAcceptOffer}
-                    className="flex-1 sm:flex-none px-4 py-2 text-xs font-semibold rounded-xl bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] transition"
-                  >
-                    Accept Transfer
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
           <AnimatePresence mode="wait" initial={false}>
             {!p.peer ? (
               /* ================= DISCONNECTED PAIRING SCREEN ================= */
@@ -415,7 +434,7 @@ export default function LocalDrop(p: Props) {
                   className="ld-connect"
                   onSubmit={(e) => {
                     e.preventDefault();
-                    if (/^\d{4}$/.test(code)) p.onConnect(code);
+                    if (/^\d{4}$/.test(code) && p.wsConnected) p.onConnect(code);
                   }}
                 >
                   <label htmlFor="ld-code">Have a code from another device?</label>
@@ -424,17 +443,22 @@ export default function LocalDrop(p: Props) {
                       id="ld-code"
                       inputMode="numeric"
                       autoComplete="off"
-                      placeholder="0000"
+                      placeholder={p.wsConnected ? '0000' : 'Starting server…'}
                       maxLength={4}
                       value={code}
+                      disabled={!p.wsConnected}
                       onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))}
                     />
                     <motion.button
                       className="ld-primary"
                       whileTap={{ scale: 0.96 }}
-                      disabled={code.length !== 4 || p.connecting}
+                      disabled={code.length !== 4 || p.connecting || !p.wsConnected}
                     >
-                      {p.connecting ? 'Connecting…' : 'Connect'}
+                      {p.connecting
+                        ? 'Connecting…'
+                        : !p.wsConnected
+                          ? 'Starting server…'
+                          : 'Connect'}
                       <ArrowUpRight size={19} />
                     </motion.button>
                   </div>
@@ -712,8 +736,14 @@ export default function LocalDrop(p: Props) {
                               {item.direction === 'sent' ? <ArrowUpRight /> : <ArrowDownLeft />}
                             </span>
                             <div className="ld-file">
-                              <strong>
-                                {item.kind === 'file' ? item.file?.name : item.text?.slice(0, 40)}
+                              <strong
+                                className="ld-filename"
+                                title={item.kind === 'file' ? item.file?.name : item.text}
+                                aria-label={item.kind === 'file' ? item.file?.name : item.text}
+                              >
+                                {item.kind === 'file'
+                                  ? formatFilename(item.file?.name || '', 40)
+                                  : item.text?.slice(0, 40)}
                               </strong>
                               <small>
                                 {item.direction === 'sent' ? 'Sent' : 'Received'} ·{' '}
@@ -817,7 +847,25 @@ export default function LocalDrop(p: Props) {
                           status: t.progress >= 100 ? 'complete' : 'active',
                           speedLabel: t.status,
                         }}
-                      />
+                      >
+                        {t.direction === 'receive' && (
+                          <ReceivedFileSave
+                            key={t.id}
+                            filename={t.name}
+                            file={t.file ?? null}
+                            receiving={t.progress < 100}
+                            transferFailed={
+                              t.status.toLowerCase().includes('fail') ||
+                              t.status.toLowerCase().includes('cancel')
+                            }
+                            initialHandle={getSaveHandle(t)}
+                            initialState={getSaveState(t)?.state}
+                            initialSavedName={getSaveState(t)?.filename}
+                            onHandleSelected={(handle) => setSaveHandle(t, handle)}
+                            onSaveStateChange={(state, name) => setSaveStateRecord(t, state, name)}
+                          />
+                        )}
+                      </TransferMotion>
                     </MotionErrorBoundary>
                   ));
                 })()}
@@ -838,30 +886,55 @@ export default function LocalDrop(p: Props) {
                           animate={{ opacity: 1, y: 0 }}
                           exit={{ opacity: 0 }}
                           transition={springs.responsive}
-                          className="ld-row"
+                          className="ld-row ld-transfer-row"
                         >
                           <span className="ld-fileicon">
                             {t.direction === 'send' ? <ArrowUpRight /> : <ArrowDownLeft />}
                           </span>
 
-                          <div className="ld-file">
-                            <strong>{t.name}</strong>
-                            <small>
+                          <div className="ld-file ld-transfer-info">
+                            <strong
+                              className="ld-filename ld-transfer-filename"
+                              title={t.name}
+                              aria-label={t.name}
+                            >
+                              {formatFilename(t.name, 40)}
+                            </strong>
+                            <small className="ld-transfer-meta">
                               {t.size} · {t.status}
                             </small>
                             <div
-                              className="ld-progress"
+                              className="ld-progress ld-progress-track"
                               role="progressbar"
                               aria-label={t.name}
-                              aria-valuenow={Math.max(0, Math.min(100, t.progress))}
+                              aria-valuenow={Math.max(0, Math.min(100, Math.round(t.progress)))}
                             >
                               <motion.i
+                                className="ld-progress-fill"
                                 animate={{
                                   width: `${Math.max(0, Math.min(100, t.progress))}%`,
                                 }}
                                 transition={{ ease: 'easeOut', duration: 0.2 }}
                               />
                             </div>
+
+                            {t.direction === 'receive' && (
+                              <ReceivedFileSave
+                                key={t.id}
+                                filename={t.name}
+                                file={t.file ?? null}
+                                receiving={t.progress < 100}
+                                transferFailed={
+                                  t.status.toLowerCase().includes('fail') ||
+                                  t.status.toLowerCase().includes('cancel')
+                                }
+                                initialHandle={getSaveHandle(t)}
+                                initialState={getSaveState(t)?.state}
+                                initialSavedName={getSaveState(t)?.filename}
+                                onHandleSelected={(handle) => setSaveHandle(t, handle)}
+                                onSaveStateChange={(state, name) => setSaveStateRecord(t, state, name)}
+                              />
+                            )}
                           </div>
 
                           {p.onCancel && t.progress < 100 && (
