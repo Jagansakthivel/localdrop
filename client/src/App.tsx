@@ -37,15 +37,20 @@ export default function App() {
   const [stagedFiles, setStagedFiles] = useState<StagedItem[]>([]);
   const [isSendingBatch, setIsSendingBatch] = useState(false);
   const [channelSessionId, setChannelSessionId] = useState<string | null>(null);
+  const lastPeerIdRef = useRef<string | null>(null);
   const autoPairAttemptedRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (connectedPeer) {
-      setChannelSessionId(connectedPeer.id || crypto.randomUUID());
-    } else {
+      if (lastPeerIdRef.current !== connectedPeer.id) {
+        lastPeerIdRef.current = connectedPeer.id;
+        setChannelSessionId(connectedPeer.id || crypto.randomUUID());
+      }
+    } else if (connectionState === 'waiting' || connectionState === 'offline' || connectionState === 'failed') {
+      lastPeerIdRef.current = null;
       setChannelSessionId(null);
     }
-  }, [connectedPeer]);
+  }, [connectedPeer, connectionState]);
 
   // Safe Auto-connect from URL ?pin=XXXX (waits until WebSocket signaling is ready)
   useEffect(() => {
@@ -211,6 +216,7 @@ export default function App() {
         size: formatBytes(telemetry.totalBytes),
         progress: telemetry.progress,
         direction: telemetry.direction === 'sending' ? 'send' : 'receive',
+        transferState: telemetry.progress >= 100 ? 'complete' : 'active',
         status:
           telemetry.progress >= 100
             ? 'Verified ✓'
@@ -236,6 +242,7 @@ export default function App() {
           size: formatBytes(item.file.size),
           progress: 100,
           direction: item.direction === 'sent' ? 'send' : 'receive',
+          transferState: 'complete',
           status: 'Completed',
           file: item.file,
         });

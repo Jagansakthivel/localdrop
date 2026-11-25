@@ -12,6 +12,7 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
   let attempts = 0;
+  let generation = 0;
   const MAX_ATTEMPTS = 15;
 
   function connect() {
@@ -21,29 +22,31 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
       return;
     }
 
+    const myGeneration = ++generation;
+
     try {
       const current = new WebSocket(url);
       socket = current;
       current.binaryType = 'arraybuffer';
 
       current.onopen = () => {
-        if (stopped || socket !== current) return;
+        if (stopped || myGeneration !== generation || socket !== current) return;
         attempts = 0;
         handlers.onOpen(current);
       };
 
       current.onmessage = (event) => {
-        if (stopped || socket !== current) return;
+        if (stopped || myGeneration !== generation || socket !== current) return;
         handlers.onMessage(event);
       };
 
       current.onerror = (event) => {
-        if (stopped || socket !== current) return;
+        if (stopped || myGeneration !== generation || socket !== current) return;
         handlers.onError(event);
       };
 
       current.onclose = (event) => {
-        if (stopped || socket !== current) return;
+        if (stopped || myGeneration !== generation || socket !== current) return;
         socket = null;
         handlers.onClose(event);
 
@@ -52,36 +55,53 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
           return;
         }
 
-        // Bounded exponential backoff with jitter (max 10s)
-        const delay = Math.min(1000 * 1.5 ** attempts, 10000) + Math.floor(Math.random() * 250);
+        // Bounded exponential backoff with jitter (cap 15s)
+        const delay = Math.min(1000 * 1.5 ** attempts, 15000) + Math.floor(Math.random() * 250);
         attempts++;
         handlers.onReconnect?.(attempts, delay);
+        if (timer) clearTimeout(timer);
         timer = setTimeout(connect, delay);
       };
     } catch (err) {
-      handlers.onError(err as Event);
+      if (!stopped && myGeneration === generation) {
+        handlers.onError(err as Event);
+      }
     }
   }
 
-  // Instant reconnection when network comes back online
-  const handleOnline = () => {
-    if (stopped || (socket && socket.readyState === WebSocket.OPEN)) return;
+  // Wake existing reconnect manager only if no OPEN or CONNECTING socket exists
+  function wake() {
+    if (stopped) return;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
     if (timer) {
       clearTimeout(timer);
       timer = null;
     }
     attempts = 0;
     connect();
+  }
+
+  const handleVisible = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      wake();
+    }
   };
 
   if (typeof window !== 'undefined') {
-    window.addEventListener('online', handleOnline);
+    window.addEventListener('online', wake);
+    window.addEventListener('pageshow', wake);
+  }
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisible);
   }
 
   connect();
 
   return {
     getSocket: () => socket,
+    wake,
 
     send(payload: string | ArrayBuffer): boolean {
       if (socket?.readyState !== WebSocket.OPEN) {
@@ -97,8 +117,13 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
 
     close() {
       stopped = true;
+      generation++;
       if (typeof window !== 'undefined') {
-        window.removeEventListener('online', handleOnline);
+        window.removeEventListener('online', wake);
+        window.removeEventListener('pageshow', wake);
+      }
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisible);
       }
       if (timer) {
         clearTimeout(timer);

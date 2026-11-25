@@ -260,7 +260,7 @@ export function LocalDropHeader({
 
 export function LocalDropFooter() {
   return (
-    <footer className="ldx-footer">
+    <footer className="ldx-footer ldv-footer">
       <div className="ldx-footer-inner">
         <p>
           Designed &amp; built by{' '}

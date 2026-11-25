@@ -29,10 +29,92 @@ const MAX_CONNECTIONS_PER_IP = 20;
 const MAX_MESSAGES_PER_SEC = 50;
 const MAX_JSON_PAYLOAD_BYTES = 64 * 1024; // 64 KB for signaling
 const MAX_BINARY_CHUNK_BYTES = 512 * 1024; // 512 KB per relay chunk
+const RESUME_GRACE_MS = 60 * 1000;
+const SESSION_TTL_MS = 60 * 60 * 1000;
+const MAX_AUTH_ATTEMPTS = 10;
+const AUTH_BLOCK_DURATION_MS = 5 * 60 * 1000;
+
+interface SessionCredential {
+  participantId: string;
+  roomCode: string;
+  tokenHash: string;
+  name: string;
+  deviceType: 'mobile' | 'desktop';
+  isHost: boolean;
+  generation: number;
+  graceUntil: number;
+  expiresAt: number;
+}
 
 const clients = new Map<string, ClientMeta>();
 const aliveClients = new WeakMap<WebSocket, boolean>();
 const ipConnectionCounts = new Map<string, number>();
+const sessionCredentials = new Map<string, SessionCredential>();
+const authRateLimits = new Map<string, { attempts: number; blockedUntil: number }>();
+
+function hashToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function generateResumeToken(): string {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function isIpAuthBlocked(ip: string): boolean {
+  const entry = authRateLimits.get(ip);
+  if (!entry) return false;
+  if (entry.blockedUntil > Date.now()) return true;
+  if (entry.blockedUntil > 0) authRateLimits.delete(ip);
+  return false;
+}
+
+function recordFailedAuthAttempt(ip: string): void {
+  const entry = authRateLimits.get(ip) ?? { attempts: 0, blockedUntil: 0 };
+  entry.attempts += 1;
+  if (entry.attempts >= MAX_AUTH_ATTEMPTS) {
+    entry.blockedUntil = Date.now() + AUTH_BLOCK_DURATION_MS;
+  }
+  authRateLimits.set(ip, entry);
+}
+
+function resetFailedAuthAttempts(ip: string): void {
+  authRateLimits.delete(ip);
+}
+
+function issueCredential(meta: ClientMeta): string {
+  const token = generateResumeToken();
+  const tokenHash = hashToken(token);
+  const now = Date.now();
+  const prev = sessionCredentials.get(meta.id);
+  sessionCredentials.set(meta.id, {
+    participantId: meta.id,
+    roomCode: meta.roomCode,
+    tokenHash,
+    name: meta.name,
+    deviceType: meta.deviceType,
+    isHost: meta.isHost,
+    generation: (prev?.generation ?? 0) + 1,
+    graceUntil: 0,
+    expiresAt: now + SESSION_TTL_MS,
+  });
+  return token;
+}
+
+function countReservedGraceSlots(roomCode: string, excludeParticipantId?: string): number {
+  const now = Date.now();
+  let count = 0;
+  for (const cred of sessionCredentials.values()) {
+    if (
+      cred.roomCode === roomCode &&
+      cred.participantId !== excludeParticipantId &&
+      cred.graceUntil > now &&
+      cred.expiresAt > now
+    ) {
+      count++;
+    }
+  }
+  return count;
+}
 
 function getClientIp(req: http.IncomingMessage): string {
   const forwarded = req.headers['x-forwarded-for'];
@@ -299,13 +381,17 @@ wss.on('connection', (ws, req) => {
       client.isHost = true;
 
       if (prevRoom && prevRoom !== roomCode) {
+        sessionCredentials.delete(client.id);
         broadcastRoomPeers(prevRoom);
       }
+
+      const resumeToken = issueCredential(client);
 
       ws.send(
         JSON.stringify({
           type: 'room-created',
           roomCode,
+          resumeToken,
         })
       );
       broadcastRoomPeers(roomCode);
@@ -324,9 +410,21 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
+      if (isIpAuthBlocked(ip)) {
+        ws.send(
+          JSON.stringify({
+            type: 'room-error',
+            code: 'TOO_MANY_ATTEMPTS',
+            message: 'Too many incorrect PIN attempts. Please wait 5 minutes before trying again.',
+          })
+        );
+        return;
+      }
+
       const existingMembers = getRoomMembers(roomCode);
 
       if (existingMembers.length === 0 && !createIfMissing) {
+        recordFailedAuthAttempt(ip);
         ws.send(
           JSON.stringify({
             type: 'room-error',
@@ -337,9 +435,10 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // Check room capacity (max 2 devices per session)
+      // Check room capacity (max 2 devices per session, including reserved grace slots)
       const others = existingMembers.filter((m) => m.id !== client.id);
-      if (others.length >= 2) {
+      const reservedGrace = countReservedGraceSlots(roomCode, client.id);
+      if (others.length + reservedGrace >= 2) {
         ws.send(
           JSON.stringify({
             type: 'room-error',
@@ -350,19 +449,25 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
+      resetFailedAuthAttempts(ip);
+
       const prevRoom = client.roomCode;
       client.roomCode = roomCode;
       client.isHost = existingMembers.length === 0;
 
       if (prevRoom && prevRoom !== roomCode) {
+        sessionCredentials.delete(client.id);
         broadcastRoomPeers(prevRoom);
       }
+
+      const resumeToken = issueCredential(client);
 
       ws.send(
         JSON.stringify({
           type: 'room-joined',
           roomCode,
           isHost: client.isHost,
+          resumeToken,
         })
       );
 
@@ -384,10 +489,92 @@ wss.on('connection', (ws, req) => {
           );
         }
       }
+    } else if (msg.type === 'resume-session') {
+      const roomCode = String(msg.roomCode || '').trim();
+      const resumeToken = typeof msg.resumeToken === 'string' ? msg.resumeToken : '';
+
+      if (isIpAuthBlocked(ip)) {
+        ws.send(
+          JSON.stringify({
+            type: 'room-error',
+            code: 'TOO_MANY_ATTEMPTS',
+            message: 'Too many failed resume attempts. Please pair again.',
+          })
+        );
+        return;
+      }
+
+      if (!/^\d{4}$/.test(roomCode) || resumeToken.length < 32) {
+        recordFailedAuthAttempt(ip);
+        ws.send(
+          JSON.stringify({
+            type: 'room-error',
+            code: 'RESUME_FAILED',
+            message: 'Invalid session credentials. Please pair again.',
+          })
+        );
+        return;
+      }
+
+      const presentedHash = hashToken(resumeToken);
+      const now = Date.now();
+      let matched: SessionCredential | undefined;
+      for (const cred of sessionCredentials.values()) {
+        if (cred.roomCode === roomCode && cred.tokenHash === presentedHash) {
+          matched = cred;
+          break;
+        }
+      }
+
+      if (!matched || (matched.graceUntil > 0 && now > matched.graceUntil) || now > matched.expiresAt) {
+        if (matched) sessionCredentials.delete(matched.participantId);
+        recordFailedAuthAttempt(ip);
+        ws.send(
+          JSON.stringify({
+            type: 'room-error',
+            code: 'RESUME_FAILED',
+            message: 'Session expired or invalid. Please pair again.',
+          })
+        );
+        return;
+      }
+
+      resetFailedAuthAttempts(ip);
+
+      // Atomically rotate token
+      const newResumeToken = generateResumeToken();
+      matched.tokenHash = hashToken(newResumeToken);
+      matched.generation += 1;
+      matched.graceUntil = 0;
+      matched.expiresAt = now + SESSION_TTL_MS;
+
+      // Restore participant ID in clients map
+      if (client.id !== matched.participantId) {
+        clients.delete(client.id);
+        client.id = matched.participantId;
+        clients.set(client.id, client);
+      }
+      client.roomCode = roomCode;
+      client.isHost = matched.isHost;
+      client.name = matched.name;
+      client.deviceType = matched.deviceType;
+
+      ws.send(
+        JSON.stringify({
+          type: 'session-resumed',
+          roomCode,
+          participantId: client.id,
+          isHost: client.isHost,
+          resumeToken: newResumeToken,
+        })
+      );
+
+      broadcastRoomPeers(roomCode);
     } else if (msg.type === 'leave-room') {
       const oldRoom = client.roomCode;
       client.roomCode = '';
       client.isHost = false;
+      sessionCredentials.delete(client.id);
       if (oldRoom) {
         broadcastRoomPeers(oldRoom);
       }
@@ -430,7 +617,14 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     const oldRoom = client.roomCode;
-    clients.delete(id);
+    clients.delete(client.id);
+
+    if (oldRoom) {
+      const cred = sessionCredentials.get(client.id);
+      if (cred) {
+        cred.graceUntil = Date.now() + RESUME_GRACE_MS;
+      }
+    }
 
     // Decrement IP count
     const curCount = ipConnectionCounts.get(ip) ?? 1;
@@ -448,6 +642,12 @@ wss.on('connection', (ws, req) => {
 
 // Periodic heartbeat: 25 seconds interval to prevent Render proxy 55s idle drop
 const heartbeatInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [pid, cred] of sessionCredentials.entries()) {
+    if ((cred.graceUntil > 0 && now > cred.graceUntil) || now > cred.expiresAt) {
+      sessionCredentials.delete(pid);
+    }
+  }
   for (const ws of wss.clients) {
     if (aliveClients.get(ws) === false) {
       ws.terminate();

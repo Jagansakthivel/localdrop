@@ -5,6 +5,7 @@ import { IceCandidateQueue } from '../utils/iceCandidateQueue';
 import { attachRtcDiagnostics } from '../utils/rtcDiagnostics';
 import { isSocketOpen, isValidPin, networkLog, pingBackendHealth } from '../utils/network';
 import { createConnectionProfiler } from '../utils/connectionProfiler';
+import { createConnectionResilience } from '../utils/connectionResilience';
 
 export interface PeerInfo {
   id: string;
@@ -139,6 +140,23 @@ export function usePeerDrop(wsUrl: string) {
   const negotiatingPeerIdRef = useRef<string | null>(null);
   const relayReadyRef = useRef<boolean>(false);
   const hasConnectedOnceRef = useRef<boolean>(false);
+  const resumeTokenRef = useRef<string | null>(null);
+  const authenticatedSessionRef = useRef<boolean>(false);
+  const directEstablishedRef = useRef<boolean>(false);
+  const resilienceRef = useRef<ReturnType<typeof createConnectionResilience> | null>(null);
+  const recoveryLockRef = useRef<Promise<void> | null>(null);
+  const sessionGenerationRef = useRef<number>(0);
+  const connectionStateRef = useRef<ConnectionState>(connectionState);
+  const wsConnectedRef = useRef<boolean>(wsConnected);
+  const backpressureWaiterRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    connectionStateRef.current = connectionState;
+  }, [connectionState]);
+
+  useEffect(() => {
+    wsConnectedRef.current = wsConnected;
+  }, [wsConnected]);
 
   useEffect(() => {
     autoAcceptRef.current = autoAccept;
@@ -275,6 +293,10 @@ export function usePeerDrop(wsUrl: string) {
 
       setConnectedPeer(peer);
       targetPeerRef.current = peer;
+      authenticatedSessionRef.current = true;
+      if (mode === 'direct') {
+        directEstablishedRef.current = true;
+      }
       setConnectionState(mode);
       setTransport(mode === 'direct' ? 'webrtc' : 'websocket');
       setLastError(null);
@@ -287,6 +309,9 @@ export function usePeerDrop(wsUrl: string) {
 
       profilerRef.current?.mark('UI connected');
       profilerRef.current?.report();
+      if (mode === 'direct') {
+        resilienceRef.current?.notify();
+      }
     },
     []
   );
@@ -500,11 +525,16 @@ export function usePeerDrop(wsUrl: string) {
       };
 
       channel.onclose = () => {
+        backpressureWaiterRef.current?.();
+        backpressureWaiterRef.current = null;
         if (dcRef.current === channel) {
           dcRef.current = null;
-          // If signaling is still healthy, fall back to relay rather than dropping entirely
+          resilienceRef.current?.notify();
           if (targetPeerRef.current && isSocketOpen(socketManagerRef.current?.getSocket() ?? null)) {
             fallbackToRelay();
+          } else if (authenticatedSessionRef.current && targetPeerRef.current) {
+            setConnectionState('reconnecting');
+            setStatusText('Direct connection interrupted, reconnecting...');
           } else {
             setConnectionState('waiting');
             setTransport(null);
@@ -516,6 +546,9 @@ export function usePeerDrop(wsUrl: string) {
 
       channel.onerror = (err) => {
         networkLog('DataChannel error:', err);
+        backpressureWaiterRef.current?.();
+        backpressureWaiterRef.current = null;
+        resilienceRef.current?.notify();
         fallbackToRelay();
       };
 
@@ -557,6 +590,7 @@ export function usePeerDrop(wsUrl: string) {
 
       pc.oniceconnectionstatechange = () => {
         networkLog('ICE connection state:', pc.iceConnectionState);
+        resilienceRef.current?.notify();
         if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
           profilerRef.current?.mark('ICE connected');
         } else if (pc.iceConnectionState === 'failed') {
@@ -566,6 +600,7 @@ export function usePeerDrop(wsUrl: string) {
 
       pc.onconnectionstatechange = () => {
         networkLog('PeerConnection connectionState:', pc.connectionState);
+        resilienceRef.current?.notify();
         if (pc.connectionState === 'connected') {
           profilerRef.current?.mark('ICE connected');
         } else if (pc.connectionState === 'failed') {
@@ -650,9 +685,10 @@ export function usePeerDrop(wsUrl: string) {
     };
   });
 
-  // Initialize and manage the reconnecting WebSocket lifecycle
+  // Initialize and manage the reconnecting WebSocket lifecycle and direct resilience controller
   useEffect(() => {
     sessionIdRef.current = crypto.randomUUID();
+    const mountGen = ++sessionGenerationRef.current;
 
     // Send asynchronous HTTP health check to wake up sleeping free-tier backends (Render cold start)
     void pingBackendHealth(8000);
@@ -661,22 +697,33 @@ export function usePeerDrop(wsUrl: string) {
       onOpen: (ws) => {
         hasConnectedOnceRef.current = true;
         setLastError(null);
-        setConnectionState('signaling');
-        setStatusText('Registering device…');
+        // Preserve healthy direct channel state during signaling reconnects
+        if (dcRef.current?.readyState !== 'open') {
+          setConnectionState('signaling');
+          setStatusText('Registering device…');
+        }
 
         // Step 1: Register client device metadata immediately upon socket connection
         const device = detectDevice();
         ws.send(JSON.stringify({ type: 'register', ...device }));
+        resilienceRef.current?.notify();
       },
 
       onClose: () => {
+        relayReadyRef.current = false;
         setWsConnected(false);
+        if (dcRef.current?.readyState === 'open') {
+          // Keep direct transport usable if its channel is healthy
+          resilienceRef.current?.notify();
+          return;
+        }
         setConnectionState('reconnecting');
         setStatusText(
           hasConnectedOnceRef.current
             ? 'Signaling disconnected, reconnecting...'
             : 'Starting LocalDrop server...'
         );
+        resilienceRef.current?.notify();
       },
 
       onError: () => {
@@ -687,6 +734,7 @@ export function usePeerDrop(wsUrl: string) {
       },
 
       onReconnect: (attempt, delay) => {
+        if (dcRef.current?.readyState === 'open') return;
         if (!hasConnectedOnceRef.current) {
           setStatusText('Starting LocalDrop server...');
         } else {
@@ -696,6 +744,8 @@ export function usePeerDrop(wsUrl: string) {
       },
 
       onExhausted: () => {
+        relayReadyRef.current = false;
+        if (dcRef.current?.readyState === 'open') return;
         setConnectionState('offline');
         setStatusText('Signaling server unavailable');
         setLastError(
@@ -717,11 +767,31 @@ export function usePeerDrop(wsUrl: string) {
         }
 
         if (msg.type === 'welcome') {
-          // Step 2: Welcome received with assigned UUID. Proceed with room creation or pending join
+          // Step 2: Welcome received with assigned UUID. Restore authenticated session or join/create room
           myIdRef.current = String(msg.id || '');
           networkLog('Registered with signaling ID:', myIdRef.current);
 
-          if (pendingPinRef.current) {
+          if (authenticatedSessionRef.current) {
+            if (resumeTokenRef.current && activeRoomRef.current) {
+              socketManager.send(
+                JSON.stringify({
+                  type: 'resume-session',
+                  roomCode: activeRoomRef.current,
+                  resumeToken: resumeTokenRef.current,
+                })
+              );
+            } else {
+              // Cannot securely restore without a valid resume credential; never blindly rejoin by PIN
+              authenticatedSessionRef.current = false;
+              if (dcRef.current?.readyState !== 'open') {
+                setConnectionState('failed');
+                setConnectedPeer(null);
+                setTransport(null);
+                setLastError('Session disconnected. Please pair again.');
+                setStatusText('Session disconnected. Please pair again.');
+              }
+            }
+          } else if (pendingPinRef.current) {
             const target = pendingPinRef.current;
             setConnectionState('pairing');
             setStatusText(`Linking to ${target}...`);
@@ -745,13 +815,22 @@ export function usePeerDrop(wsUrl: string) {
         } else if (msg.type === 'room-created') {
           // Step 3: Room confirmed by server. Now pairing is ready!
           activeRoomRef.current = String(msg.roomCode);
+          if (typeof msg.resumeToken === 'string') {
+            resumeTokenRef.current = msg.resumeToken;
+          }
           profilerRef.current?.mark('room ack');
           setWsConnected(true);
-          setConnectionState('waiting');
-          setStatusText('Ready to pair');
+          if (dcRef.current?.readyState !== 'open') {
+            setConnectionState('waiting');
+            setStatusText('Ready to pair');
+          }
           setLastError(null);
         } else if (msg.type === 'room-joined') {
           activeRoomRef.current = String(msg.roomCode);
+          if (typeof msg.resumeToken === 'string') {
+            resumeTokenRef.current = msg.resumeToken;
+          }
+          authenticatedSessionRef.current = true;
           profilerRef.current?.mark('room ack');
           setWsConnected(true);
           pendingPinRef.current = null;
@@ -759,12 +838,39 @@ export function usePeerDrop(wsUrl: string) {
             clearTimeout(pairingTimeoutTimerRef.current);
             pairingTimeoutTimerRef.current = null;
           }
+        } else if (msg.type === 'session-resumed') {
+          activeRoomRef.current = String(msg.roomCode);
+          if (typeof msg.participantId === 'string' && msg.participantId) {
+            myIdRef.current = msg.participantId;
+          }
+          if (typeof msg.resumeToken === 'string') {
+            resumeTokenRef.current = msg.resumeToken;
+          }
+          setWsConnected(true);
+          setLastError(null);
+          if (dcRef.current?.readyState === 'open') {
+            setConnectionState('direct');
+            setTransport('webrtc');
+          } else if (directEstablishedRef.current) {
+            resilienceRef.current?.notify();
+          } else if (targetPeerRef.current) {
+            socketManager.send(
+              JSON.stringify({
+                type: 'relay',
+                payload: {
+                  type: 'relay-ping',
+                  from: myIdRef.current,
+                  sessionId: sessionIdRef.current,
+                },
+              })
+            );
+          }
         } else if (msg.type === 'room-error') {
-          // Room rejected (e.g. ROOM_NOT_FOUND, ROOM_FULL, INVALID_PIN)
+          // Room rejected (e.g. ROOM_NOT_FOUND, ROOM_FULL, INVALID_PIN, RESUME_FAILED)
+          const code = String(msg.code || '');
           const errorMsg = String(msg.message || 'Pairing error');
           setLastError(errorMsg);
           setStatusText(errorMsg);
-          setConnectionState('failed');
           pendingPinRef.current = null;
           profilerRef.current?.report();
 
@@ -773,19 +879,31 @@ export function usePeerDrop(wsUrl: string) {
             pairingTimeoutTimerRef.current = null;
           }
 
-          // Restore own host room so device remains discoverable
-          activeRoomRef.current = pin;
-          socketManager.send(
-            JSON.stringify({
-              type: 'create-room',
-              roomCode: pin,
-            })
-          );
+          if (code === 'RESUME_FAILED' || code === 'TOO_MANY_ATTEMPTS') {
+            resumeTokenRef.current = null;
+            authenticatedSessionRef.current = false;
+            if (dcRef.current?.readyState !== 'open') {
+              setConnectionState('failed');
+              setConnectedPeer(null);
+              setTransport(null);
+            }
+          } else {
+            setConnectionState('failed');
+            // Restore own host room so device remains discoverable
+            activeRoomRef.current = pin;
+            socketManager.send(
+              JSON.stringify({
+                type: 'create-room',
+                roomCode: pin,
+              })
+            );
+          }
         } else if (msg.type === 'room-peers') {
           const peers: PeerInfo[] = (msg.peers as PeerInfo[]) || [];
           if (peers.length > 0) {
             const peer = peers[0];
             targetPeerRef.current = peer;
+            authenticatedSessionRef.current = true;
 
             if (!profilerRef.current) {
               profilerRef.current = createConnectionProfiler();
@@ -806,13 +924,24 @@ export function usePeerDrop(wsUrl: string) {
               );
             }
 
+            // Preserve healthy open DataChannel instead of restarting negotiation
+            if (dcRef.current?.readyState === 'open' && pcRef.current?.connectionState === 'connected') {
+              networkLog(`Keeping healthy direct DataChannel with ${peer.name}`);
+              return;
+            }
+
             // Deterministic offer initiator: lexicographical UUID comparison
             const isInitiator = myIdRef.current < peer.id;
             networkLog(`Room paired with ${peer.name}. Is initiator: ${isInitiator}`);
             callbacksRef.current.startNegotiation(peer, isInitiator);
           } else {
-            // Peer left
+            // Peer left or is temporarily reconnecting within grace period
+            if (dcRef.current?.readyState === 'open') {
+              return;
+            }
             targetPeerRef.current = null;
+            authenticatedSessionRef.current = false;
+            directEstablishedRef.current = false;
             callbacksRef.current.teardownPeerConnection();
             setConnectedPeer(null);
             setConnectionState('waiting');
@@ -825,6 +954,7 @@ export function usePeerDrop(wsUrl: string) {
           const peer = msg.peer as PeerInfo;
           if (peer && peer.id !== myIdRef.current) {
             targetPeerRef.current = peer;
+            authenticatedSessionRef.current = true;
 
             if (!profilerRef.current) {
               profilerRef.current = createConnectionProfiler();
@@ -843,6 +973,10 @@ export function usePeerDrop(wsUrl: string) {
                   },
                 })
               );
+            }
+
+            if (dcRef.current?.readyState === 'open' && pcRef.current?.connectionState === 'connected') {
+              return;
             }
 
             const isInitiator = myIdRef.current < peer.id;
@@ -892,9 +1026,99 @@ export function usePeerDrop(wsUrl: string) {
 
     socketManagerRef.current = socketManager;
 
+    // Direct transport recovery controller (only active for previously established DIRECT sessions)
+    const resilience = createConnectionResilience({
+      socketState: () => socketManagerRef.current?.getSocket()?.readyState,
+      peer: () => pcRef.current,
+      channel: () => dcRef.current,
+      hasSession: () =>
+        directEstablishedRef.current &&
+        authenticatedSessionRef.current &&
+        Boolean(targetPeerRef.current),
+      transferActive: () => isTransferActiveRef.current,
+      ensureSignaling: () => {
+        socketManagerRef.current?.wake();
+      },
+      recoverPeer: async (signal: AbortSignal) => {
+        const runRecovery = async () => {
+          const startGen = sessionGenerationRef.current;
+          if (
+            signal.aborted ||
+            startGen !== sessionGenerationRef.current ||
+            isTransferActiveRef.current ||
+            !wsConnectedRef.current ||
+            !authenticatedSessionRef.current ||
+            !targetPeerRef.current
+          ) {
+            return;
+          }
+
+          const peer = targetPeerRef.current;
+          const pc = pcRef.current;
+
+          // Keep current channel if healthy
+          if (dcRef.current?.readyState === 'open' && pc?.connectionState === 'connected') {
+            return;
+          }
+
+          const isInitiator = myIdRef.current < peer.id;
+
+          if (pc && pc.signalingState !== 'closed' && pc.connectionState !== 'failed') {
+            try {
+              if (typeof pc.restartIce === 'function') {
+                pc.restartIce();
+              }
+              if (isInitiator) {
+                const offer = await pc.createOffer({ iceRestart: true });
+                if (signal.aborted || startGen !== sessionGenerationRef.current) return;
+                await pc.setLocalDescription(offer);
+                if (signal.aborted || startGen !== sessionGenerationRef.current) return;
+                callbacksRef.current.sendSignal(peer.id, { sdp: pc.localDescription });
+              }
+              return;
+            } catch {
+              // Fall through to full peer recreation if ICE restart fails
+            }
+          }
+
+          if (signal.aborted || startGen !== sessionGenerationRef.current || isTransferActiveRef.current) {
+            return;
+          }
+
+          // Recreate peer only after confirming no active transfer, negotiating with the same authenticated peer
+          negotiatingPeerIdRef.current = null;
+          await callbacksRef.current.startNegotiation(peer, isInitiator);
+        };
+
+        const prev = recoveryLockRef.current ?? Promise.resolve();
+        const next = prev.then(runRecovery, runRecovery);
+        recoveryLockRef.current = next;
+        try {
+          await next;
+        } finally {
+          if (recoveryLockRef.current === next) {
+            recoveryLockRef.current = null;
+          }
+        }
+      },
+      report: () => {
+        // Advisory only; UI connected status is derived strictly from live channel / confirmed relay
+      },
+    });
+    resilienceRef.current = resilience;
+
     return () => {
+      if (mountGen === sessionGenerationRef.current) {
+        sessionGenerationRef.current++;
+      }
+      resilience.dispose();
+      if (resilienceRef.current === resilience) {
+        resilienceRef.current = null;
+      }
       if (pairingTimeoutTimerRef.current) clearTimeout(pairingTimeoutTimerRef.current);
       if (negotiationTimerRef.current) clearTimeout(negotiationTimerRef.current);
+      backpressureWaiterRef.current?.();
+      backpressureWaiterRef.current = null;
       callbacksRef.current.teardownPeerConnection();
       socketManager.close();
       socketManagerRef.current = null;
@@ -964,6 +1188,15 @@ export function usePeerDrop(wsUrl: string) {
 
   // Manual disconnect / session teardown
   const disconnect = useCallback(() => {
+    sessionGenerationRef.current++;
+    authenticatedSessionRef.current = false;
+    directEstablishedRef.current = false;
+    resumeTokenRef.current = null;
+    relayReadyRef.current = false;
+    backpressureWaiterRef.current?.();
+    backpressureWaiterRef.current = null;
+    resilienceRef.current?.notify();
+
     teardownPeerConnection();
     targetPeerRef.current = null;
     setConnectedPeer(null);
@@ -972,6 +1205,8 @@ export function usePeerDrop(wsUrl: string) {
     setIncomingOffer(null);
     setTelemetry(null);
     setStatusText('Ready to pair');
+
+    socketManagerRef.current?.send(JSON.stringify({ type: 'leave-room' }));
 
     // Return to own host room
     activeRoomRef.current = pin;
@@ -1036,6 +1271,8 @@ export function usePeerDrop(wsUrl: string) {
 
   const cancelTransfer = useCallback(() => {
     cancelFlagRef.current = true;
+    backpressureWaiterRef.current?.();
+    backpressureWaiterRef.current = null;
     if (pendingOfferResolverRef.current) {
       pendingOfferResolverRef.current.resolve(false);
       pendingOfferResolverRef.current = null;
@@ -1169,14 +1406,40 @@ export function usePeerDrop(wsUrl: string) {
           }
           if (dcRef.current.bufferedAmount > 1024 * 1024) {
             await new Promise<void>((resolve) => {
-              if (!dcRef.current) return resolve();
-              dcRef.current.onbufferedamountlow = () => {
-                if (dcRef.current) dcRef.current.onbufferedamountlow = null;
+              const dc = dcRef.current;
+              if (!dc || dc.readyState !== 'open' || cancelFlagRef.current) {
+                return resolve();
+              }
+              let resolved = false;
+              const finish = () => {
+                if (resolved) return;
+                resolved = true;
+                clearTimeout(bpTimer);
+                if (dc.onbufferedamountlow === finish) {
+                  dc.onbufferedamountlow = null;
+                }
+                if (backpressureWaiterRef.current === finish) {
+                  backpressureWaiterRef.current = null;
+                }
                 resolve();
               };
+              const bpTimer = setTimeout(finish, 10000);
+              backpressureWaiterRef.current = finish;
+              dc.onbufferedamountlow = finish;
             });
           }
-          dcRef.current.send(chunk);
+          if (cancelFlagRef.current || dcRef.current?.readyState !== 'open') {
+            isTransferActiveRef.current = false;
+            setStatusText('Transfer failed: direct connection interrupted');
+            return false;
+          }
+          try {
+            dcRef.current.send(chunk);
+          } catch {
+            isTransferActiveRef.current = false;
+            setStatusText('Transfer failed: direct connection interrupted');
+            return false;
+          }
         } else {
           const sm = socketManagerRef.current;
           const socket = sm?.getSocket();

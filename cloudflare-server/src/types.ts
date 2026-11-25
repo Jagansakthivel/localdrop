@@ -25,6 +25,7 @@ export type ClientMessage =
   | { type: 'register'; name?: string; deviceType?: 'mobile' | 'desktop' }
   | { type: 'create-room'; roomCode: string }
   | { type: 'join-room'; roomCode: string; createIfMissing?: boolean }
+  | { type: 'resume-session'; roomCode: string; resumeToken: string }
   | { type: 'leave-room' }
   | { type: 'signal'; to: string; signal: unknown }
   | { type: 'relay'; payload: unknown }
@@ -33,8 +34,9 @@ export type ClientMessage =
 // Server -> Client Messages
 export type ServerMessage =
   | { type: 'welcome'; id: string }
-  | { type: 'room-created'; roomCode: string }
-  | { type: 'room-joined'; roomCode: string; isHost: boolean }
+  | { type: 'room-created'; roomCode: string; resumeToken?: string }
+  | { type: 'room-joined'; roomCode: string; isHost: boolean; resumeToken?: string }
+  | { type: 'session-resumed'; roomCode: string; participantId: string; isHost: boolean; resumeToken: string }
   | { type: 'room-peers'; roomCode: string; peers: PeerInfo[] }
   | { type: 'peer-joined-room'; roomCode: string; peer: PeerInfo }
   | { type: 'room-error'; code: string; message: string }
@@ -67,6 +69,7 @@ export const SECURITY_LIMITS = {
   MAX_PIN_ATTEMPTS: 10,
   PIN_BLOCK_DURATION_MS: 5 * 60 * 1000, // 5 minutes
   ROOM_TTL_MS: 60 * 60 * 1000,          // 1 hour
+  RESUME_GRACE_MS: 60 * 1000,           // 60 seconds
 } as const;
 
 export interface Env {

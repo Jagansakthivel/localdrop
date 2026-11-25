@@ -37,6 +37,17 @@ export class SignalingHub extends DurableObject<Env> {
           blocked_until INTEGER NOT NULL,
           last_attempt INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS session_credentials (
+          participant_id TEXT PRIMARY KEY,
+          room_code TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          name TEXT NOT NULL,
+          device_type TEXT NOT NULL,
+          is_host INTEGER NOT NULL,
+          generation INTEGER NOT NULL,
+          grace_until INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
       `);
     } catch (err) {
       console.error('[SignalingHub SQLite] Database initialization error:', err);
@@ -270,13 +281,17 @@ export class SignalingHub extends DurableObject<Env> {
         this.saveRoom(roomCode, meta.id);
 
         if (prevRoom && prevRoom !== roomCode) {
+          this.deleteCredential(meta.id);
           this.broadcastRoomPeers(prevRoom);
           this.cleanUpRoomIfEmpty(prevRoom);
         }
 
+        const resumeToken = await this.issueCredential(meta);
+
         this.sendJson(ws, {
           type: 'room-created',
           roomCode,
+          resumeToken,
         });
         this.broadcastRoomPeers(roomCode);
         break;
@@ -321,9 +336,10 @@ export class SignalingHub extends DurableObject<Env> {
           return;
         }
 
-        // Capacity check: max 2 devices per session
+        // Capacity check: max 2 devices per session (including reserved grace slots)
         const others = existingMembers.filter((m) => m.meta.id !== meta.id);
-        if (others.length >= 2) {
+        const reservedGraceCount = this.countReservedGraceSlots(roomCode, meta.id);
+        if (others.length + reservedGraceCount >= 2) {
           this.sendJson(ws, {
             type: 'room-error',
             code: 'ROOM_FULL',
@@ -344,14 +360,18 @@ export class SignalingHub extends DurableObject<Env> {
         this.saveRoom(roomCode, meta.isHost ? meta.id : existingMembers[0].meta.id);
 
         if (prevRoom && prevRoom !== roomCode) {
+          this.deleteCredential(meta.id);
           this.broadcastRoomPeers(prevRoom);
           this.cleanUpRoomIfEmpty(prevRoom);
         }
+
+        const resumeToken = await this.issueCredential(meta);
 
         this.sendJson(ws, {
           type: 'room-joined',
           roomCode,
           isHost: meta.isHost,
+          resumeToken,
         });
 
         this.broadcastRoomPeers(roomCode);
@@ -371,11 +391,74 @@ export class SignalingHub extends DurableObject<Env> {
         break;
       }
 
+      case 'resume-session': {
+        const roomCode = String(msg.roomCode || '').trim();
+        const resumeToken = typeof msg.resumeToken === 'string' ? msg.resumeToken : '';
+
+        if (this.isIpPinBlocked(meta.ip)) {
+          this.sendJson(ws, {
+            type: 'room-error',
+            code: 'TOO_MANY_ATTEMPTS',
+            message: 'Too many failed resume attempts. Please pair again.',
+          });
+          ws.serializeAttachment(meta);
+          return;
+        }
+
+        if (!/^\d{4}$/.test(roomCode) || resumeToken.length < 32) {
+          this.recordFailedPinAttempt(meta.ip);
+          this.sendJson(ws, {
+            type: 'room-error',
+            code: 'RESUME_FAILED',
+            message: 'Invalid session credentials. Please pair again.',
+          });
+          ws.serializeAttachment(meta);
+          return;
+        }
+
+        const rotated = await this.validateAndRotateCredential(roomCode, resumeToken);
+        if (!rotated) {
+          this.recordFailedPinAttempt(meta.ip);
+          this.sendJson(ws, {
+            type: 'room-error',
+            code: 'RESUME_FAILED',
+            message: 'Session expired or invalid. Please pair again.',
+          });
+          ws.serializeAttachment(meta);
+          return;
+        }
+
+        this.resetFailedPinAttempts(meta.ip);
+
+        meta.id = rotated.participantId;
+        meta.roomCode = roomCode;
+        meta.isHost = rotated.isHost;
+        meta.name = rotated.name;
+        meta.deviceType = rotated.deviceType;
+        ws.serializeAttachment(meta);
+
+        this.saveRoom(roomCode, meta.id);
+
+        this.sendJson(ws, {
+          type: 'session-resumed',
+          roomCode,
+          participantId: meta.id,
+          isHost: meta.isHost,
+          resumeToken: rotated.newResumeToken,
+        });
+
+        this.broadcastRoomPeers(roomCode);
+        break;
+      }
+
       case 'leave-room': {
         const oldRoom = meta.roomCode;
+        const oldId = meta.id;
         meta.roomCode = '';
         meta.isHost = false;
         ws.serializeAttachment(meta);
+
+        this.deleteCredential(oldId);
 
         if (oldRoom) {
           this.broadcastRoomPeers(oldRoom);
@@ -441,10 +524,12 @@ export class SignalingHub extends DurableObject<Env> {
    */
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     let oldRoom = '';
+    let participantId = '';
     try {
       const meta = ws.deserializeAttachment() as ClientMeta | null;
       if (meta?.roomCode) {
         oldRoom = meta.roomCode;
+        participantId = meta.id;
       }
     } catch {
       // Ignore
@@ -456,9 +541,44 @@ export class SignalingHub extends DurableObject<Env> {
       // Ignore
     }
 
-    if (oldRoom) {
+    if (oldRoom && participantId) {
+      await this.markCredentialGrace(participantId);
       this.broadcastRoomPeers(oldRoom);
       this.cleanUpRoomIfEmpty(oldRoom);
+    }
+  }
+
+  /**
+   * Durable Object alarm: purge expired grace credentials and empty rooms across hibernation.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    try {
+      this.ctx.storage.sql.exec(
+        'DELETE FROM session_credentials WHERE (grace_until > 0 AND grace_until <= ?) OR expires_at <= ?',
+        now,
+        now
+      );
+
+      // Clean up any rooms that have neither active sockets nor active grace credentials
+      const roomRows = this.ctx.storage.sql.exec('SELECT room_code FROM rooms').toArray();
+      for (const row of roomRows) {
+        const roomCode = String((row as Record<string, unknown>).room_code || '');
+        if (roomCode) {
+          this.cleanUpRoomIfEmpty(roomCode);
+        }
+      }
+
+      // Schedule next alarm if any credentials are still in grace
+      const nextRows = this.ctx.storage.sql
+        .exec('SELECT MIN(grace_until) AS next_grace FROM session_credentials WHERE grace_until > 0')
+        .toArray();
+      const nextGrace = Number((nextRows[0] as Record<string, unknown> | undefined)?.next_grace || 0);
+      if (nextGrace > now) {
+        await this.ctx.storage.setAlarm(nextGrace);
+      }
+    } catch (err) {
+      console.error('[SignalingHub Alarm] Error purging expired sessions:', err);
     }
   }
 
@@ -613,12 +733,196 @@ export class SignalingHub extends DurableObject<Env> {
 
   private cleanUpRoomIfEmpty(roomCode: string): void {
     const remaining = this.getRoomSockets(roomCode);
-    if (remaining.length === 0) {
+    const reserved = this.countReservedGraceSlots(roomCode);
+    if (remaining.length === 0 && reserved === 0) {
       try {
         this.ctx.storage.sql.exec('DELETE FROM rooms WHERE room_code = ?', roomCode);
+        this.ctx.storage.sql.exec('DELETE FROM session_credentials WHERE room_code = ?', roomCode);
       } catch {
         // Ignore
       }
+    }
+  }
+
+  // --- Resume Credential Helpers (256-bit random + SHA-256) ---
+
+  private generateResumeToken(): string {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  private async hashToken(token: string): Promise<string> {
+    const data = new TextEncoder().encode(token);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    const bytes = new Uint8Array(digest);
+    return Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  private async issueCredential(meta: ClientMeta): Promise<string> {
+    const token = this.generateResumeToken();
+    const tokenHash = await this.hashToken(token);
+    const now = Date.now();
+    const expiresAt = now + SECURITY_LIMITS.ROOM_TTL_MS;
+
+    try {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO session_credentials
+           (participant_id, room_code, token_hash, name, device_type, is_host, generation, grace_until, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?)
+         ON CONFLICT(participant_id) DO UPDATE SET
+           room_code = ?,
+           token_hash = ?,
+           name = ?,
+           device_type = ?,
+           is_host = ?,
+           generation = generation + 1,
+           grace_until = 0,
+           expires_at = ?`,
+        meta.id,
+        meta.roomCode,
+        tokenHash,
+        meta.name,
+        meta.deviceType,
+        meta.isHost ? 1 : 0,
+        expiresAt,
+        meta.roomCode,
+        tokenHash,
+        meta.name,
+        meta.deviceType,
+        meta.isHost ? 1 : 0,
+        expiresAt
+      );
+    } catch (err) {
+      console.error('[SignalingHub SQLite] Error issuing credential:', err);
+    }
+    return token;
+  }
+
+  private async markCredentialGrace(participantId: string): Promise<void> {
+    const now = Date.now();
+    const graceUntil = now + SECURITY_LIMITS.RESUME_GRACE_MS;
+    try {
+      this.ctx.storage.sql.exec(
+        'UPDATE session_credentials SET grace_until = ? WHERE participant_id = ?',
+        graceUntil,
+        participantId
+      );
+      const currentAlarm = await this.ctx.storage.getAlarm();
+      if (!currentAlarm || currentAlarm > graceUntil) {
+        await this.ctx.storage.setAlarm(graceUntil);
+      }
+    } catch (err) {
+      console.error('[SignalingHub SQLite] Error marking grace period:', err);
+    }
+  }
+
+  private deleteCredential(participantId: string): void {
+    try {
+      this.ctx.storage.sql.exec('DELETE FROM session_credentials WHERE participant_id = ?', participantId);
+    } catch {
+      // Ignore
+    }
+  }
+
+  private countReservedGraceSlots(roomCode: string, excludeParticipantId?: string): number {
+    try {
+      const now = Date.now();
+      const rows = this.ctx.storage.sql
+        .exec(
+          'SELECT participant_id FROM session_credentials WHERE room_code = ? AND grace_until > ? AND expires_at > ?',
+          roomCode,
+          now,
+          now
+        )
+        .toArray();
+      let count = 0;
+      for (const row of rows) {
+        const pid = String((row as Record<string, unknown>).participant_id || '');
+        if (pid && pid !== excludeParticipantId) {
+          count++;
+        }
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async validateAndRotateCredential(
+    roomCode: string,
+    presentedToken: string
+  ): Promise<{
+    participantId: string;
+    name: string;
+    deviceType: 'mobile' | 'desktop';
+    isHost: boolean;
+    newResumeToken: string;
+  } | null> {
+    const presentedHash = await this.hashToken(presentedToken);
+    const now = Date.now();
+
+    try {
+      const rows = this.ctx.storage.sql
+        .exec(
+          `SELECT participant_id, name, device_type, is_host, generation, grace_until, expires_at
+           FROM session_credentials
+           WHERE room_code = ? AND token_hash = ?`,
+          roomCode,
+          presentedHash
+        )
+        .toArray();
+
+      if (rows.length === 0) return null;
+
+      const row = rows[0] as Record<string, unknown>;
+      const participantId = String(row.participant_id || '');
+      const graceUntil = Number(row.grace_until || 0);
+      const expiresAt = Number(row.expires_at || 0);
+      const currentGen = Number(row.generation || 1);
+
+      if ((graceUntil > 0 && now > graceUntil) || now > expiresAt) {
+        this.deleteCredential(participantId);
+        return null;
+      }
+
+      const newResumeToken = this.generateResumeToken();
+      const newHash = await this.hashToken(newResumeToken);
+      const newExpiresAt = now + SECURITY_LIMITS.ROOM_TTL_MS;
+
+      // Atomic conditional update by generation + old hash to prevent replay races
+      const res = this.ctx.storage.sql.exec(
+        `UPDATE session_credentials
+         SET token_hash = ?, generation = ?, grace_until = 0, expires_at = ?
+         WHERE participant_id = ? AND token_hash = ? AND generation = ?`,
+        newHash,
+        currentGen + 1,
+        newExpiresAt,
+        participantId,
+        presentedHash,
+        currentGen
+      );
+
+      if (res.rowsWritten === 0) {
+        return null;
+      }
+
+      return {
+        participantId,
+        name: String(row.name || 'Device'),
+        deviceType: row.device_type === 'mobile' ? 'mobile' : 'desktop',
+        isHost: Number(row.is_host || 0) === 1,
+        newResumeToken,
+      };
+    } catch (err) {
+      console.error('[SignalingHub SQLite] Error validating resume credential:', err);
+      return null;
     }
   }
 }

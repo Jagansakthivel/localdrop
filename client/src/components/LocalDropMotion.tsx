@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { formatFilename } from '../utils/formatFilename';
 import '../motion.css';
@@ -53,15 +53,25 @@ export function Handshake({
 }) {
   const reduced = useReducedMotion();
   const [visible, setVisible] = useState(false);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!connectionId) {
       setVisible(false);
       return;
     }
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
     setVisible(true);
-    const timer = setTimeout(() => setVisible(false), reduced ? 1200 : 2350);
-    return () => clearTimeout(timer);
+    const timer = setTimeout(() => setVisible(false), reduced ? 1200 : 2100);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setVisible(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('keydown', onKeyDown);
+      previousFocusRef.current?.focus?.();
+    };
   }, [connectionId, reduced]);
 
   return (
@@ -76,7 +86,7 @@ export function Handshake({
           exit={{ opacity: 0 }}
         >
           <motion.div
-            className="ld-handshake-sheet"
+            className="ld-handshake-sheet ldv-connection-modal"
             initial={reduced ? false : { y: 24, scale: 0.94 }}
             animate={{ y: 0, scale: 1 }}
             transition={spring}
@@ -141,6 +151,7 @@ export function Handshake({
               <p>{peerName || 'Peer'}</p>
             </motion.div>
             <button
+              type="button"
               className="ld-dismiss"
               onClick={() => setVisible(false)}
               aria-label="Dismiss connection confirmation"
@@ -232,6 +243,7 @@ export function FileStack({
               {validFiles.length === 1 ? 'file' : 'files'}
             </h3>
             <button
+              type="button"
               className="ld-text-button"
               aria-expanded={expanded}
               aria-controls={id}
@@ -256,7 +268,7 @@ export function FileStack({
                 <div key={f.id} className="ld-file-row">
                   <span title={f.name}>{formatFilename(f.name || 'Unnamed file', 36)}</span>
                   <small>{f.sizeLabel}</small>
-                  <button onClick={() => onRemove(f.id)} aria-label={`Remove ${f.name}`}>
+                  <button type="button" onClick={() => onRemove(f.id)} aria-label={`Remove ${f.name}`}>
                     ×
                   </button>
                 </div>

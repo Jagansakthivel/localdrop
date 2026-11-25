@@ -33,8 +33,11 @@ import { MotionErrorBoundary } from './MotionErrorBoundary';
 import { normalizeFiles, useSafeThumbnails, formatBytes, type NormalizedFile } from '../utils/fileAdapter';
 import { ReceivedFileSave, type SaveState } from './ReceivedFileSave';
 import { IncomingTransferPopup, type IncomingTransferOffer } from './IncomingTransferPopup';
+import { ActivityRow, type ActivityState } from './ActivityRow';
+import { getTransportCopy } from '../utils/transportCopy';
 import type { SaveFileHandle } from '../utils/saveReceivedFile';
 import '../localdrop.css';
+import './mobile-refinement.css';
 
 export type Transfer = {
   id: string;
@@ -43,8 +46,18 @@ export type Transfer = {
   progress: number;
   direction: 'send' | 'receive';
   status: string;
+  transferState?: ActivityState;
   file?: File | null;
 };
+
+function getActivityState(t: Transfer): ActivityState {
+  const s = t.status.toLowerCase();
+  if (t.transferState === 'failed' || s.includes('fail')) return 'failed';
+  if (t.transferState === 'cancelled' || s.includes('cancel')) return 'cancelled';
+  if (t.transferState === 'active') return 'active';
+  if (t.transferState === 'complete' || t.progress >= 100) return 'complete';
+  return 'active';
+}
 
 export type StagedItem = NormalizedFile;
 
@@ -201,6 +214,29 @@ export default function LocalDrop(p: Props) {
     }));
   }, [normalizedStaged, thumbnails]);
 
+  const tCopy = getTransportCopy(p.connectionState, p.transport, p.wsConnected);
+  const eligiblePdfCount = useMemo(
+    () =>
+      p.sharedItems.filter(
+        (i) =>
+          i.kind === 'file' &&
+          i.file &&
+          (i.file.type === 'application/pdf' || i.file.name.toLowerCase().endsWith('.pdf'))
+      ).length,
+    [p.sharedItems]
+  );
+  const activeTransfers = useMemo(
+    () => p.transfers.filter((t) => getActivityState(t) === 'active'),
+    [p.transfers]
+  );
+  const historyTransfers = useMemo(
+    () =>
+      p.transfers.filter(
+        (t) => getActivityState(t) !== 'active' && t.id !== 'active-telemetry'
+      ),
+    [p.transfers]
+  );
+
   useEffect(() => {
     if (dark) {
       document.documentElement.classList.add('ld-dark');
@@ -303,7 +339,7 @@ export default function LocalDrop(p: Props) {
           deviceName={p.device}
           peerName={p.peer}
           state={
-            p.connectionState === 'direct' || p.connectionState === 'relayed' || Boolean(p.peer)
+            p.connectionState === 'direct' || (p.connectionState === 'relayed' && p.wsConnected)
               ? 'connected'
               : p.connectionState === 'waiting' && p.wsConnected
                 ? 'ready'
@@ -389,12 +425,13 @@ export default function LocalDrop(p: Props) {
                     <div className="ld-pin pairing-code">{p.pin}</div>
 
                     <div className="ld-actions">
-                      <button onClick={copy}>
+                      <button type="button" onClick={copy}>
                         {copied ? <Check size={16} /> : <Copy size={16} />}
                         {copied ? 'Copied' : 'Copy code'}
                       </button>
 
                       <button
+                        type="button"
                         onClick={() => setQr(!qr)}
                         aria-expanded={qr}
                       >
@@ -476,15 +513,15 @@ export default function LocalDrop(p: Props) {
                 className="ld-work"
               >
                 {/* Peer Header */}
-                <div className="ld-peer">
+                <div className="ld-peer ldv-peer">
                   <div>
                     <span className="ld-kicker">
-                      <span className="ld-dot" /> CONNECTED
+                      <span className="ld-dot" /> {tCopy.peerLabel}
                     </span>
                     <h1>{p.peer}</h1>
                   </div>
 
-                  <button className="ld-quiet" onClick={p.onDisconnect}>
+                  <button type="button" className="ld-quiet" onClick={p.onDisconnect}>
                     Disconnect
                   </button>
                 </div>
@@ -503,6 +540,7 @@ export default function LocalDrop(p: Props) {
                   ].map((t) => (
                     <button
                       key={t.id}
+                      type="button"
                       role="tab"
                       aria-selected={tab === t.id}
                       onClick={() => setTab(t.id as any)}
@@ -534,7 +572,7 @@ export default function LocalDrop(p: Props) {
                     >
                       {/* Drag & Drop Target */}
                       <div
-                        className={'ld-drop ' + (drag ? 'ld-drag' : '')}
+                        className={'ld-drop ldv-drop ' + (drag ? 'ld-drag' : '')}
                         onDragOver={(e) => {
                           e.preventDefault();
                           setDrag(true);
@@ -554,11 +592,19 @@ export default function LocalDrop(p: Props) {
                           <Plus size={34} />
                         </motion.div>
 
-                        <h2>{drag ? 'Release to send' : 'Drop it here.'}</h2>
-                        <p>Send files directly to your connected device.</p>
+                        <h2>
+                          <span className="ldv-desktop-title">
+                            {drag ? 'Release to send' : 'Drop it here.'}
+                          </span>
+                          <span className="ldv-touch-title">
+                            {drag ? 'Release to send' : 'Send files'}
+                          </span>
+                        </h2>
+                        <p>{tCopy.dropSubtitle}</p>
 
                         <div className="ld-actions">
                           <motion.button
+                            type="button"
                             whileTap={{ scale: 0.96 }}
                             className="ld-primary"
                             onClick={() => input.current?.click()}
@@ -567,7 +613,7 @@ export default function LocalDrop(p: Props) {
                           </motion.button>
 
                           {p.onFolder && (
-                            <button onClick={p.onFolder}>
+                            <button type="button" onClick={p.onFolder}>
                               <Folder size={17} /> Folder
                             </button>
                           )}
@@ -667,7 +713,7 @@ export default function LocalDrop(p: Props) {
                   {tab === 'clipboard' && (
                     <motion.form
                       key="clipboard-tab"
-                      className="ld-clip"
+                      className="ld-clip ldv-clipboard"
                       initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: -8 }}
@@ -686,7 +732,7 @@ export default function LocalDrop(p: Props) {
                         value={clip}
                         onChange={(e) => setClip(e.target.value)}
                       />
-                      <button className="ld-primary" disabled={!clip.trim()}>
+                      <button type="submit" className="ld-primary" disabled={!clip.trim()}>
                         <Clipboard size={17} /> Send text
                       </button>
                     </motion.form>
@@ -699,7 +745,7 @@ export default function LocalDrop(p: Props) {
                       initial={{ opacity: 0, y: 8 }}
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: -8 }}
-                      className="bg-[var(--surface)] border border-[var(--line)] rounded-3xl p-6"
+                      className="bg-[var(--surface)] border border-[var(--line)] rounded-3xl p-6 ldv-vault"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
                         <div>
@@ -709,7 +755,7 @@ export default function LocalDrop(p: Props) {
                           </p>
                         </div>
 
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 ldv-vault-actions">
                           {p.onBatchZip && p.sharedItems.length > 0 && (
                             <button
                               type="button"
@@ -722,6 +768,12 @@ export default function LocalDrop(p: Props) {
                           {p.onMergePdfs && (
                             <button
                               type="button"
+                              disabled={eligiblePdfCount < 2}
+                              title={
+                                eligiblePdfCount < 2
+                                  ? 'Requires at least 2 PDF files in this session'
+                                  : 'Merge session PDFs'
+                              }
                               onClick={p.onMergePdfs}
                               className="px-3 py-1.5 text-xs font-semibold rounded-xl border border-[var(--line)] hover:bg-[var(--line)] flex items-center gap-1.5 transition"
                             >
@@ -791,15 +843,15 @@ export default function LocalDrop(p: Props) {
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
-                          <span className="text-[var(--muted)] block mb-1">Signaling Transport</span>
+                          <span className="text-[var(--muted)] block mb-1">Active Transport</span>
                           <strong className="text-sm font-semibold">
-                            {p.wsConnected ? 'Connected (ws://8080)' : 'Offline / Reconnecting'}
+                            {tCopy.diagnosticsLabel}
                           </strong>
                         </div>
 
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
-                          <span className="text-[var(--muted)] block mb-1">Data Channel Security</span>
-                          <strong className="text-sm font-semibold">DTLS-SRTP 256-bit GCM</strong>
+                          <span className="text-[var(--muted)] block mb-1">Transport Security</span>
+                          <strong className="text-sm font-semibold">{tCopy.securityLabel}</strong>
                         </div>
 
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
@@ -828,134 +880,112 @@ export default function LocalDrop(p: Props) {
                 </AnimatePresence>
 
                 {/* Activity Feed */}
-                <h2 className="ld-activity">
-                  Activity <span>{p.transfers.length}</span>
-                </h2>
+                {tab === 'files' ? (
+                  <>
+                    <h2 className="ld-activity ldv-activity-heading">
+                      Activity <span>{p.transfers.length}</span>
+                    </h2>
 
-                {/* Signature Packet Departure (Send) & Packet Assembly (Receive) for active & recent transfers */}
-                {(() => {
-                  const active = p.transfers.filter(
-                    (t) => t.progress < 100 || t.id === 'active-telemetry'
-                  );
-                  const displayTargets = active.length > 0 ? active.slice(0, 3) : p.transfers.slice(0, 1);
-                  return displayTargets.map((t) => (
-                    <MotionErrorBoundary key={t.id} name="TransferMotion">
-                      <TransferMotion
-                        transfer={{
-                          id: t.id,
-                          name: t.name,
-                          direction: t.direction,
-                          progress: t.progress,
-                          status: t.progress >= 100 ? 'complete' : 'active',
-                          speedLabel: t.status,
-                        }}
-                      >
-                        {t.direction === 'receive' && (
-                          <ReceivedFileSave
-                            key={t.id}
-                            filename={t.name}
-                            file={t.file ?? null}
-                            receiving={t.progress < 100}
-                            transferFailed={
-                              t.status.toLowerCase().includes('fail') ||
-                              t.status.toLowerCase().includes('cancel')
-                            }
-                            initialHandle={getSaveHandle(t)}
-                            initialState={getSaveState(t)?.state}
-                            initialSavedName={getSaveState(t)?.filename}
-                            onHandleSelected={(handle) => setSaveHandle(t, handle)}
-                            onSaveStateChange={(state, name) => setSaveStateRecord(t, state, name)}
-                          />
-                        )}
-                      </TransferMotion>
-                    </MotionErrorBoundary>
-                  ));
-                })()}
-
-                <div className="ld-list mt-3">
-                  <AnimatePresence initial={false}>
-                    {p.transfers
-                      .filter((t, idx) =>
-                        p.transfers.some((item) => item.progress < 100 || item.id === 'active-telemetry')
-                          ? t.progress >= 100 && t.id !== 'active-telemetry'
-                          : idx > 0
-                      )
-                      .map((t) => (
+                    {/* Signature Packet Departure (Send) & Packet Assembly (Receive) for active transfers only */}
+                    <AnimatePresence initial={false}>
+                      {activeTransfers.slice(0, 3).map((t) => (
                         <motion.div
-                          layout
                           key={t.id}
-                          initial={{ opacity: 0, y: 8 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0 }}
-                          transition={springs.responsive}
-                          className="ld-row ld-transfer-row"
+                          layout
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: 'auto' }}
+                          exit={{ opacity: 0, height: 0 }}
+                          transition={reduced ? { duration: 0 } : { duration: 0.25 }}
+                          style={{ overflow: 'hidden' }}
                         >
-                          <span className="ld-fileicon">
-                            {t.direction === 'send' ? <ArrowUpRight /> : <ArrowDownLeft />}
-                          </span>
-
-                          <div className="ld-file ld-transfer-info">
-                            <strong
-                              className="ld-filename ld-transfer-filename"
-                              title={t.name}
-                              aria-label={t.name}
+                          <MotionErrorBoundary name="TransferMotion">
+                            <TransferMotion
+                              transfer={{
+                                id: t.id,
+                                name: t.name,
+                                direction: t.direction,
+                                progress: t.progress,
+                                status: 'active',
+                                speedLabel: t.status,
+                              }}
                             >
-                              {formatFilename(t.name, 40)}
-                            </strong>
-                            <small className="ld-transfer-meta">
-                              {t.size} · {t.status}
-                            </small>
-                            <div
-                              className="ld-progress ld-progress-track"
-                              role="progressbar"
-                              aria-label={t.name}
-                              aria-valuenow={Math.max(0, Math.min(100, Math.round(t.progress)))}
-                            >
-                              <motion.i
-                                className="ld-progress-fill"
-                                animate={{
-                                  width: `${Math.max(0, Math.min(100, t.progress))}%`,
-                                }}
-                                transition={{ ease: 'easeOut', duration: 0.2 }}
-                              />
-                            </div>
-
-                            {t.direction === 'receive' && (
-                              <ReceivedFileSave
-                                key={t.id}
-                                filename={t.name}
-                                file={t.file ?? null}
-                                receiving={t.progress < 100}
-                                transferFailed={
-                                  t.status.toLowerCase().includes('fail') ||
-                                  t.status.toLowerCase().includes('cancel')
-                                }
-                                initialHandle={getSaveHandle(t)}
-                                initialState={getSaveState(t)?.state}
-                                initialSavedName={getSaveState(t)?.filename}
-                                onHandleSelected={(handle) => setSaveHandle(t, handle)}
-                                onSaveStateChange={(state, name) => setSaveStateRecord(t, state, name)}
-                              />
-                            )}
-                          </div>
-
-                          {p.onCancel && t.progress < 100 && (
-                            <button
-                              className="ld-icon"
-                              aria-label={'Cancel ' + t.name}
-                              onClick={() => p.onCancel?.(t.id)}
-                            >
-                              <X />
-                            </button>
-                          )}
+                              {t.direction === 'receive' && (
+                                <ReceivedFileSave
+                                  key={t.id}
+                                  filename={t.name}
+                                  file={t.file ?? null}
+                                  receiving={t.progress < 100}
+                                  transferFailed={false}
+                                  initialHandle={getSaveHandle(t)}
+                                  initialState={getSaveState(t)?.state}
+                                  initialSavedName={getSaveState(t)?.filename}
+                                  onHandleSelected={(handle) => setSaveHandle(t, handle)}
+                                  onSaveStateChange={(state, name) => setSaveStateRecord(t, state, name)}
+                                />
+                              )}
+                            </TransferMotion>
+                          </MotionErrorBoundary>
                         </motion.div>
                       ))}
-                  </AnimatePresence>
+                    </AnimatePresence>
 
-                  {!p.transfers.length && (
-                    <p className="ld-empty">Files you exchange will appear here.</p>
-                  )}
-                </div>
+                    <div className="ld-list mt-3">
+                      {historyTransfers.map((t) => {
+                        const rowState = getActivityState(t);
+                        return (
+                          <ActivityRow
+                            key={t.id}
+                            name={t.name}
+                            size={t.size}
+                            direction={t.direction}
+                            state={rowState}
+                            progress={t.progress}
+                            detail={rowState === 'active' ? t.status : undefined}
+                            onCancel={p.onCancel ? () => p.onCancel?.(t.id) : undefined}
+                            saveControl={
+                              t.direction === 'receive' && rowState === 'complete' ? (
+                                <ReceivedFileSave
+                                  key={t.id}
+                                  filename={t.name}
+                                  file={t.file ?? null}
+                                  receiving={t.progress < 100}
+                                  transferFailed={false}
+                                  initialHandle={getSaveHandle(t)}
+                                  initialState={getSaveState(t)?.state}
+                                  initialSavedName={getSaveState(t)?.filename}
+                                  onHandleSelected={(handle) => setSaveHandle(t, handle)}
+                                  onSaveStateChange={(state, name) =>
+                                    setSaveStateRecord(t, state, name)
+                                  }
+                                />
+                              ) : undefined
+                            }
+                          />
+                        );
+                      })}
+
+                      {!p.transfers.length && (
+                        <p className="ld-empty">Files you exchange will appear here.</p>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  activeTransfers.length > 0 && (
+                    <div className="mt-4 p-3 rounded-2xl border border-[var(--line)] bg-[var(--surface)] flex items-center justify-between gap-3">
+                      <span className="text-xs font-medium text-[var(--ink)] truncate">
+                        {activeTransfers.length} active{' '}
+                        {activeTransfers.length === 1 ? 'transfer' : 'transfers'} ({activeTransfers[0].name})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setTab('files')}
+                        className="text-xs font-semibold text-[var(--accent)] flex-shrink-0 min-h-[44px] px-2"
+                      >
+                        View in Files
+                      </button>
+                    </div>
+                  )
+                )}
               </motion.section>
             )}
           </AnimatePresence>
@@ -986,6 +1016,7 @@ export default function LocalDrop(p: Props) {
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="ld-modal-title !mb-0">Settings & Info</h3>
                   <button
+                    type="button"
                     className="ld-icon"
                     onClick={() => setShowSettingsModal(false)}
                     aria-label="Close modal"
