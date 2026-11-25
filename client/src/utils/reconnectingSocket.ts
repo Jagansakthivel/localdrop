@@ -16,6 +16,10 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
 
   function connect() {
     if (stopped) return;
+    // Guard against duplicate concurrent WebSocket creation
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
 
     try {
       const current = new WebSocket(url);
@@ -48,8 +52,8 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
           return;
         }
 
-        const delay =
-          Math.min(1000 * 2 ** attempts, 15000) + Math.floor(Math.random() * 300);
+        // Bounded exponential backoff with jitter (max 10s)
+        const delay = Math.min(1000 * 1.5 ** attempts, 10000) + Math.floor(Math.random() * 250);
         attempts++;
         handlers.onReconnect?.(attempts, delay);
         timer = setTimeout(connect, delay);
@@ -57,6 +61,21 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
     } catch (err) {
       handlers.onError(err as Event);
     }
+  }
+
+  // Instant reconnection when network comes back online
+  const handleOnline = () => {
+    if (stopped || (socket && socket.readyState === WebSocket.OPEN)) return;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    attempts = 0;
+    connect();
+  };
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', handleOnline);
   }
 
   connect();
@@ -78,13 +97,26 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
 
     close() {
       stopped = true;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline);
+      }
       if (timer) {
         clearTimeout(timer);
         timer = null;
       }
       const current = socket;
       socket = null;
-      current?.close();
+      if (current) {
+        current.onopen = null;
+        current.onmessage = null;
+        current.onerror = null;
+        current.onclose = null;
+        try {
+          current.close();
+        } catch {
+          // ignore close errors during teardown
+        }
+      }
     },
   };
 }

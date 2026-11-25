@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import type { ConnectionState, TransportType, NetworkDiagnostics } from '../types/network';
 import { createReconnectingSocket } from '../utils/reconnectingSocket';
 import { IceCandidateQueue } from '../utils/iceCandidateQueue';
@@ -597,15 +597,15 @@ export function usePeerDrop(wsUrl: string) {
       setStatusText(`Establishing connection with ${peer.name}...`);
       targetPeerRef.current = peer;
 
+      const pc = createPeerConnection(peer);
+
       // Start safety timeout: if WebRTC direct channel isn't established, fall back to relay
       if (negotiationTimerRef.current) clearTimeout(negotiationTimerRef.current);
       negotiationTimerRef.current = setTimeout(() => {
         networkLog('WebRTC negotiation timed out, falling back to relay');
         profilerRef.current?.report();
-        fallbackToRelay();
+        callbacksRef.current.fallbackToRelay();
       }, NEGOTIATION_TIMEOUT_MS);
-
-      const pc = createPeerConnection(peer);
 
       if (isInitiator) {
         try {
@@ -625,47 +625,48 @@ export function usePeerDrop(wsUrl: string) {
     [createPeerConnection, setupDataChannel, sendSignal, fallbackToRelay]
   );
 
+  // Stable callback references to prevent tearing down the WebSocket when peer callbacks change
+  const callbacksRef = useRef({
+    startNegotiation,
+    createPeerConnection,
+    setupDataChannel,
+    sendSignal,
+    handleProtocolJson,
+    handleBinaryChunk,
+    teardownPeerConnection,
+    fallbackToRelay,
+  });
+
+  useLayoutEffect(() => {
+    callbacksRef.current = {
+      startNegotiation,
+      createPeerConnection,
+      setupDataChannel,
+      sendSignal,
+      handleProtocolJson,
+      handleBinaryChunk,
+      teardownPeerConnection,
+      fallbackToRelay,
+    };
+  });
+
   // Initialize and manage the reconnecting WebSocket lifecycle
   useEffect(() => {
     sessionIdRef.current = crypto.randomUUID();
 
-    // Send HTTP health check to wake up sleeping free-tier backends (Render cold start)
+    // Send asynchronous HTTP health check to wake up sleeping free-tier backends (Render cold start)
     void pingBackendHealth(8000);
 
     const socketManager = createReconnectingSocket(wsUrl, {
       onOpen: (ws) => {
         hasConnectedOnceRef.current = true;
-        setWsConnected(true);
         setLastError(null);
-        setConnectionState('waiting');
+        setConnectionState('signaling');
+        setStatusText('Registering device…');
 
-        // Register client device metadata
+        // Step 1: Register client device metadata immediately upon socket connection
         const device = detectDevice();
         ws.send(JSON.stringify({ type: 'register', ...device }));
-
-        // If a PIN pairing request was queued, join that room; otherwise create own host room
-        if (pendingPinRef.current) {
-          const target = pendingPinRef.current;
-          setConnectionState('pairing');
-          setStatusText(`Linking to ${target}...`);
-          ws.send(
-            JSON.stringify({
-              type: 'join-room',
-              roomCode: target,
-              createIfMissing: false,
-            })
-          );
-        } else {
-          // Host own PIN room with createIfMissing: true
-          activeRoomRef.current = pin;
-          ws.send(
-            JSON.stringify({
-              type: 'create-room',
-              roomCode: pin,
-            })
-          );
-          setStatusText('Ready to pair');
-        }
       },
 
       onClose: () => {
@@ -704,7 +705,7 @@ export function usePeerDrop(wsUrl: string) {
 
       onMessage: async (event) => {
         if (event.data instanceof ArrayBuffer) {
-          handleBinaryChunk(event.data);
+          callbacksRef.current.handleBinaryChunk(event.data);
           return;
         }
 
@@ -716,16 +717,43 @@ export function usePeerDrop(wsUrl: string) {
         }
 
         if (msg.type === 'welcome') {
+          // Step 2: Welcome received with assigned UUID. Proceed with room creation or pending join
           myIdRef.current = String(msg.id || '');
           networkLog('Registered with signaling ID:', myIdRef.current);
+
+          if (pendingPinRef.current) {
+            const target = pendingPinRef.current;
+            setConnectionState('pairing');
+            setStatusText(`Linking to ${target}...`);
+            socketManager.send(
+              JSON.stringify({
+                type: 'join-room',
+                roomCode: target,
+                createIfMissing: false,
+              })
+            );
+          } else {
+            // Host own PIN room
+            activeRoomRef.current = pin;
+            socketManager.send(
+              JSON.stringify({
+                type: 'create-room',
+                roomCode: pin,
+              })
+            );
+          }
         } else if (msg.type === 'room-created') {
+          // Step 3: Room confirmed by server. Now pairing is ready!
           activeRoomRef.current = String(msg.roomCode);
           profilerRef.current?.mark('room ack');
+          setWsConnected(true);
           setConnectionState('waiting');
           setStatusText('Ready to pair');
+          setLastError(null);
         } else if (msg.type === 'room-joined') {
           activeRoomRef.current = String(msg.roomCode);
           profilerRef.current?.mark('room ack');
+          setWsConnected(true);
           pendingPinRef.current = null;
           if (pairingTimeoutTimerRef.current) {
             clearTimeout(pairingTimeoutTimerRef.current);
@@ -781,11 +809,11 @@ export function usePeerDrop(wsUrl: string) {
             // Deterministic offer initiator: lexicographical UUID comparison
             const isInitiator = myIdRef.current < peer.id;
             networkLog(`Room paired with ${peer.name}. Is initiator: ${isInitiator}`);
-            startNegotiation(peer, isInitiator);
+            callbacksRef.current.startNegotiation(peer, isInitiator);
           } else {
             // Peer left
             targetPeerRef.current = null;
-            teardownPeerConnection();
+            callbacksRef.current.teardownPeerConnection();
             setConnectedPeer(null);
             setConnectionState('waiting');
             setTransport(null);
@@ -818,10 +846,10 @@ export function usePeerDrop(wsUrl: string) {
             }
 
             const isInitiator = myIdRef.current < peer.id;
-            startNegotiation(peer, isInitiator);
+            callbacksRef.current.startNegotiation(peer, isInitiator);
           }
         } else if (msg.type === 'relay') {
-          handleProtocolJson(msg.payload as Record<string, unknown>);
+          callbacksRef.current.handleProtocolJson(msg.payload as Record<string, unknown>);
         } else if (msg.type === 'signal') {
           const sender: PeerInfo = {
             id: String(msg.from),
@@ -831,7 +859,7 @@ export function usePeerDrop(wsUrl: string) {
 
           let pc = pcRef.current;
           if (!pc || pc.signalingState === 'closed') {
-            pc = createPeerConnection(sender);
+            pc = callbacksRef.current.createPeerConnection(sender);
           }
 
           const signal = msg.signal as {
@@ -847,13 +875,13 @@ export function usePeerDrop(wsUrl: string) {
               if (signal.sdp.type === 'offer') {
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
-                sendSignal(sender.id, { sdp: pc.localDescription });
+                callbacksRef.current.sendSignal(sender.id, { sdp: pc.localDescription });
               } else if (signal.sdp.type === 'answer') {
                 profilerRef.current?.mark('answer installed');
               }
             } catch (err) {
               networkLog('Error handling remote SDP signal:', err);
-              fallbackToRelay();
+              callbacksRef.current.fallbackToRelay();
             }
           } else if (signal?.candidate) {
             await iceQueueRef.current.add(pc, signal.candidate);
@@ -867,22 +895,11 @@ export function usePeerDrop(wsUrl: string) {
     return () => {
       if (pairingTimeoutTimerRef.current) clearTimeout(pairingTimeoutTimerRef.current);
       if (negotiationTimerRef.current) clearTimeout(negotiationTimerRef.current);
-      teardownPeerConnection();
+      callbacksRef.current.teardownPeerConnection();
       socketManager.close();
       socketManagerRef.current = null;
     };
-  }, [
-    wsUrl,
-    pin,
-    startNegotiation,
-    createPeerConnection,
-    setupDataChannel,
-    sendSignal,
-    handleProtocolJson,
-    handleBinaryChunk,
-    teardownPeerConnection,
-    fallbackToRelay,
-  ]);
+  }, [wsUrl, pin]);
 
   // Request to connect with a 4-digit PIN
   const connectWithPin = useCallback(

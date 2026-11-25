@@ -82,7 +82,5 @@ export function isValidPin(pin: string): boolean {
 }
 
 export function networkLog(event: string, details?: unknown): void {
-  if (import.meta.env.DEV) {
-    console.info(`[LocalDrop Network] ${event}`, details ?? '');
-  }
+  console.info(`[LocalDrop Network] ${event}`, details !== undefined ? details : '');
 }

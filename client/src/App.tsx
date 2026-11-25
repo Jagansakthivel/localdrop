@@ -61,8 +61,9 @@ export default function App() {
   }, [wsConnected, connectedPeer, connectWithPin]);
 
   const pairingUrl = useMemo(() => {
-    const loc = window.location;
-    return `${loc.protocol}//${loc.host}/?pin=${pin}`;
+    const publicUrl = import.meta.env.VITE_PUBLIC_APP_URL?.replace(/\/+$/, '');
+    const base = publicUrl || `${window.location.protocol}//${window.location.host}`;
+    return `${base}/?pin=${pin}`;
   }, [pin]);
 
   // Add files to staging with defensive normalization

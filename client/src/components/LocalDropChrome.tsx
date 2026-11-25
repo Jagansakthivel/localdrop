@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import './localdrop-chrome.css';
 
-export type ConnectionState = 'connected' | 'connecting' | 'offline';
+export type ConnectionState = 'connected' | 'ready' | 'connecting' | 'offline';
 
 export type LocalDropChromeProps = {
   deviceName: string;
@@ -113,7 +113,13 @@ export function LocalDropHeader({
   }, [open]);
 
   const statusText =
-    state === 'connected' ? 'Connected' : state === 'connecting' ? 'Connecting' : 'Ready to pair';
+    state === 'connected'
+      ? 'Connected'
+      : state === 'ready'
+        ? 'Ready to pair'
+        : state === 'offline'
+          ? 'Offline'
+          : 'Connecting';
 
   return (
     <header className="ldx-header">

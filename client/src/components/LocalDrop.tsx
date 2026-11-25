@@ -305,9 +305,11 @@ export default function LocalDrop(p: Props) {
           state={
             p.connectionState === 'direct' || p.connectionState === 'relayed' || Boolean(p.peer)
               ? 'connected'
-              : p.connectionState === 'offline'
-                ? 'offline'
-                : 'connecting'
+              : p.connectionState === 'waiting' && p.wsConnected
+                ? 'ready'
+                : p.connectionState === 'offline'
+                  ? 'offline'
+                  : 'connecting'
           }
           secure={p.transport === 'webrtc'}
           transportLabel={

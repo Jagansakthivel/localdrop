@@ -152,7 +152,8 @@
   background: var(--ldx-muted);
 }
 
-.ldx-status-dot--connected {
+.ldx-status-dot--connected,
+.ldx-status-dot--ready {
   background: var(--ldx-success);
   box-shadow: none;
 }
@@ -160,6 +161,11 @@
 .ldx-status-dot--connecting {
   background: var(--ldx-accent);
   animation: ldx-breathe 1.6s ease-in-out infinite;
+}
+
+.ldx-status-dot--offline {
+  background: var(--ldx-muted);
+  box-shadow: none;
 }
 
 @keyframes ldx-breathe {
