@@ -1,48 +1,58 @@
 import { Env } from './types';
 export { SignalingHub } from './SignalingHub';
 
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://client-taupe-one-79.vercel.app',
+];
+
+function isLocalDevHost(host: string): boolean {
+  return (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host.endsWith('.local') ||
+    host.startsWith('192.168.') ||
+    host.startsWith('10.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  );
+}
+
 /**
  * Origin validation for browser security.
- * Permits local development, LAN testing, Vercel deployments, and configured domains.
+ * Enforces exact normalized origin allowlist (plus local dev/LAN origins).
  */
 function isOriginAllowed(originHeader: string | null, customOrigins?: string): boolean {
   if (!originHeader) return true; // Non-browser clients, automated curl/pings, or same-origin
 
   try {
     const originUrl = new URL(originHeader);
+    if (originUrl.protocol !== 'http:' && originUrl.protocol !== 'https:') {
+      return false;
+    }
+    const normalizedOrigin = originUrl.origin.toLowerCase();
     const host = originUrl.hostname.toLowerCase();
 
-    // Localhost & LAN
-    if (
-      host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host === '::1' ||
-      host.endsWith('.local') ||
-      host.startsWith('192.168.') ||
-      host.startsWith('10.') ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-    ) {
+    if (isLocalDevHost(host)) {
       return true;
     }
 
-    // Vercel production and preview domains
-    if (host === 'vercel.app' || host.endsWith('.vercel.app')) {
-      return true;
-    }
+    const configuredList = customOrigins
+      ? customOrigins
+          .split(',')
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean)
+      : DEFAULT_ALLOWED_ORIGINS;
 
-    // Custom allowed origins from Wrangler vars / environment
-    if (customOrigins) {
-      const allowedList = customOrigins
-        .split(',')
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean);
-
-      if (allowedList.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))) {
-        return true;
+    return configuredList.some((allowed) => {
+      if (allowed.startsWith('http://') || allowed.startsWith('https://')) {
+        try {
+          return new URL(allowed).origin.toLowerCase() === normalizedOrigin;
+        } catch {
+          return false;
+        }
       }
-    }
-
-    return false;
+      return host === allowed;
+    });
   } catch {
     return false;
   }

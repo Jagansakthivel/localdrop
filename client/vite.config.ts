@@ -16,6 +16,7 @@ export default defineConfig({
         cleanupOutdatedCaches: true,
         clientsClaim: true,
         skipWaiting: true,
+        navigateFallbackDenylist: [/^\/ws/, /^\/api/, /^\/health/, /^\/stats/],
       },
       manifest: {
         name: 'LocalDrop',
@@ -45,9 +46,15 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/ws': {
-        target: 'ws://localhost:8080',
+        target: process.env.VITE_DEV_BACKEND_URL || 'http://localhost:8080',
         ws: true,
         rewriteWsOrigin: true,
+      },
+      '/health': {
+        target: process.env.VITE_DEV_BACKEND_URL || 'http://localhost:8080',
+      },
+      '/api': {
+        target: process.env.VITE_DEV_BACKEND_URL || 'http://localhost:8080',
       },
     },
   },

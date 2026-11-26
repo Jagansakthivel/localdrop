@@ -89,16 +89,11 @@ export function IncomingTransferPopup({
   const [decision, setDecision] = useState<'idle' | 'accepted' | 'declined'>('idle');
   const [error, setError] = useState('');
 
-  // Store information from previous render to preserve active details during exit animation
-  const [prevOffer, setPrevOffer] = useState<IncomingTransferOffer | null>(null);
-  const [cachedOffer, setCachedOffer] = useState<IncomingTransferOffer | null>(offer);
-
-  if (offer !== prevOffer) {
-    setPrevOffer(offer);
-    if (offer) {
-      setCachedOffer(offer);
-    }
-  }
+  useEffect(() => {
+    setDecision('idle');
+    setError('');
+    processingRef.current = false;
+  }, [offer?.id]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -143,27 +138,30 @@ export function IncomingTransferPopup({
   };
 
   async function respond(action: 'accepted' | 'declined') {
-    const targetOffer = offer || cachedOffer;
+    const targetOffer = offer;
     if (!targetOffer || processingRef.current) return;
 
+    const offerId = targetOffer.id;
     processingRef.current = true;
     setDecision(action);
     setError('');
 
     try {
       if (action === 'accepted') {
-        await onAccept(targetOffer.id);
+        await onAccept(offerId);
       } else {
-        await onDecline(targetOffer.id);
+        await onDecline(offerId);
       }
     } catch {
-      processingRef.current = false;
-      setDecision('idle');
-      setError('Unable to respond. Please try again.');
+      if (offer?.id === offerId) {
+        processingRef.current = false;
+        setDecision('idle');
+        setError('Unable to respond. Please try again.');
+      }
     }
   }
 
-  const activeOffer = offer || (decision !== 'idle' ? cachedOffer : null);
+  const activeOffer = offer; // AnimatePresence retains the exiting element itself.
 
   const SenderIcon = activeOffer?.senderDeviceType === 'mobile' ? Smartphone : Laptop;
   const ReceiverIcon =

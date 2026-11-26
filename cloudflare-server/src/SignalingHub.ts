@@ -1,3 +1,7 @@
+import { roomWireVersion } from './network-v2/protocol';
+import { SerialQueue, SocketEventQueue } from './network-v2/eventQueue';
+import { admitRelayMeta } from './network-v2/relayAdmission';
+import { RoomIndex } from './network-v2/roomIndex';
 import { DurableObject } from 'cloudflare:workers';
 import {
   ClientMeta,
@@ -27,9 +31,17 @@ import { resolveTurnOrigin } from './index';
  * Uses Cloudflare WebSocket Hibernation API for zero-cost standby and sub-millisecond edge wakeups.
  */
 export class SignalingHub extends DurableObject<Env> {
+  private readonly socketEvents = new SocketEventQueue<WebSocket>();
+  private readonly membershipEvents = new SerialQueue();
+  private readonly roomsIndex = new RoomIndex<WebSocket, ClientMeta>(
+    (ws) => ws.deserializeAttachment() as ClientMeta | null,
+    (ws) => ws.readyState === WebSocket.OPEN && !this.terminatedSockets.has(ws)
+  );
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.initDatabase();
+    this.roomsIndex.hydrate(this.ctx.getWebSockets());
   }
 
   /**
@@ -94,9 +106,9 @@ export class SignalingHub extends DurableObject<Env> {
                 this.ctx.storage.sql.exec(sql, ...args);
               },
               transaction: (fn) => this.ctx.storage.transactionSync(fn),
-              activeParticipant: (roomCode, id, clientIp) =>
+              activeParticipant: (roomCode, id, _clientIp) =>
                 this.getRoomSockets(roomCode).some(
-                  (p) => p.meta.id === id && p.meta.ip === clientIp && p.ws.readyState === WebSocket.OPEN
+                  (p) => p.meta.id === id && p.ws.readyState === WebSocket.OPEN
                 ),
             },
             room,
@@ -107,14 +119,13 @@ export class SignalingHub extends DurableObject<Env> {
       );
     }
 
-    // 1. Health check and telemetry endpoints
-    if (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/stats') {
-      return this.handleHealthCheck();
-    }
-
-    // 2. WebSocket upgrade handling
+    // WebSocket upgrades must precede HTTP health routing.
     if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       return this.handleWebSocketUpgrade(request);
+    }
+
+    if (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/stats') {
+      return this.handleHealthCheck();
     }
 
     return new Response(JSON.stringify({ error: 'Not Found', path: url.pathname }), {
@@ -217,9 +228,51 @@ export class SignalingHub extends DurableObject<Env> {
   }
 
   /**
-   * WebSocket Hibernation API: handle incoming message from client.
+   * WebSocket Hibernation API: serialize incoming socket events & membership transitions.
    */
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    const bytes =
+      typeof message === 'string' ? new TextEncoder().encode(message).length : message.byteLength;
+    try {
+      await this.socketEvents.run(ws, bytes, async () => {
+        if (ws.readyState !== WebSocket.OPEN || this.terminatedSockets.has(ws)) return;
+        let isMembership = false;
+        if (typeof message === 'string' && message.length <= SECURITY_LIMITS.MAX_JSON_PAYLOAD_BYTES) {
+          try {
+            const parsed = JSON.parse(message) as { type?: unknown };
+            if (
+              parsed &&
+              typeof parsed === 'object' &&
+              (parsed.type === 'register' ||
+                parsed.type === 'create-room' ||
+                parsed.type === 'join-room' ||
+                parsed.type === 'resume-session' ||
+                parsed.type === 'leave-room')
+            ) {
+              isMembership = true;
+            }
+          } catch {
+            // Validation handled inside dispatchMessage
+          }
+        }
+        if (isMembership) {
+          await this.membershipEvents.run(() => this.dispatchMessage(ws, message));
+        } else {
+          await this.dispatchMessage(ws, message);
+        }
+      });
+    } catch (err) {
+      this.sendJson(ws, {
+        type: 'error',
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: err instanceof Error ? err.message : 'Signaling queue overloaded',
+      });
+      await this.handleSocketTermination(ws, 1008, 'Signaling queue overloaded');
+    }
+  }
+
+  private async dispatchMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
+    if (ws.readyState !== WebSocket.OPEN || this.terminatedSockets.has(ws)) return;
     let meta: ClientMeta;
     try {
       meta = ws.deserializeAttachment() as ClientMeta;
@@ -233,7 +286,13 @@ export class SignalingHub extends DurableObject<Env> {
     if (message instanceof ArrayBuffer) {
       if (!meta.roomCode) return;
 
-      if (meta.networkVersion === 2) {
+      const paired = this.getRoomSockets(meta.roomCode).filter((m) => m.meta.id !== meta.id);
+      const wireVersion = roomWireVersion(meta.networkVersion, paired.map((p) => p.meta.networkVersion));
+      if (wireVersion === null) {
+        this.abortRelayTransfer(ws, meta, 'Relay requires exactly one paired peer');
+        return;
+      }
+      if (wireVersion === 2) {
         if (message.byteLength > MAX_RELAY_FRAME) {
           this.abortRelayTransfer(ws, meta, 'Relay frame exceeds 256 KiB limit');
           return;
@@ -327,9 +386,17 @@ export class SignalingHub extends DurableObject<Env> {
         return;
       }
 
+      // Mixed/v1 sessions retain compatibility but must also be bandwidth limited.
+      const legacyBudget = consume(meta.binaryBucket, message.byteLength, RELAY_RATE, RELAY_BURST);
+      meta.binaryBucket = legacyBudget.state;
+      if (!legacyBudget.allowed) {
+        ws.serializeAttachment(meta);
+        this.abortRelayTransfer(ws, meta, 'Legacy relay bandwidth quota exceeded');
+        return;
+      }
       // Legacy v1 binary forwarding
       if (message.byteLength > SECURITY_LIMITS.MAX_BINARY_CHUNK_BYTES) {
-        console.warn(`[SignalingHub] Binary chunk exceeded limit (${message.byteLength} bytes)`);
+        this.abortRelayTransfer(ws, meta, 'Legacy relay frame exceeds size limit');
         return;
       }
 
@@ -435,10 +502,31 @@ export class SignalingHub extends DurableObject<Env> {
           return;
         }
 
+        // Reject occupied PINs before modifying membership or credentials.
+        let occupied = false;
+        try {
+          const occupants = this.getRoomSockets(roomCode).filter((m) => m.ws !== ws);
+          occupied = occupants.length > 0 || this.countReservedGraceSlots(roomCode, meta.id) > 0;
+        } catch {
+          occupied = true;
+        }
+        if (occupied) {
+          this.sendJson(ws, { type: 'room-error', code: 'ROOM_TAKEN', message: 'PIN already in use' });
+          ws.serializeAttachment(meta);
+          return;
+        }
         const prevRoom = meta.roomCode;
+        const prevTransferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
+        if (prevRoom && prevRoom !== roomCode) {
+          if (prevTransferId) {
+            this.notifyRoomTransferAborted(prevRoom, meta.id, prevTransferId, 'Peer left room');
+          }
+          meta.relayLedger = undefined;
+          meta.relayPending = undefined;
+        }
         meta.roomCode = roomCode;
         meta.isHost = true;
-        ws.serializeAttachment(meta);
+        this.persistMeta(ws, meta);
 
         this.saveRoom(roomCode, meta.id);
 
@@ -515,9 +603,17 @@ export class SignalingHub extends DurableObject<Env> {
         this.resetFailedPinAttempts(meta.ip);
 
         const prevRoom = meta.roomCode;
+        const prevTransferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
+        if (prevRoom && prevRoom !== roomCode) {
+          if (prevTransferId) {
+            this.notifyRoomTransferAborted(prevRoom, meta.id, prevTransferId, 'Peer left room');
+          }
+          meta.relayLedger = undefined;
+          meta.relayPending = undefined;
+        }
         meta.roomCode = roomCode;
         meta.isHost = existingMembers.length === 0;
-        ws.serializeAttachment(meta);
+        this.persistMeta(ws, meta);
 
         this.saveRoom(roomCode, meta.isHost ? meta.id : existingMembers[0].meta.id);
 
@@ -547,6 +643,7 @@ export class SignalingHub extends DurableObject<Env> {
               id: meta.id,
               name: meta.name,
               deviceType: meta.deviceType,
+              networkVersion: meta.networkVersion ?? 1,
             },
           });
         }
@@ -592,6 +689,24 @@ export class SignalingHub extends DurableObject<Env> {
 
         this.resetFailedPinAttempts(meta.ip);
 
+        // Close any stale half-open socket still carrying the same participantId (HIGH-09)
+        for (const existingWs of this.ctx.getWebSockets()) {
+          if (existingWs === ws) continue;
+          try {
+            const existingMeta = existingWs.deserializeAttachment() as ClientMeta | null;
+            if (existingMeta && existingMeta.id === rotated.participantId) {
+              existingMeta.roomCode = '';
+              existingMeta.relayPending = undefined;
+              existingMeta.relayLedger = undefined;
+              existingWs.serializeAttachment(existingMeta);
+              this.terminatedSockets.add(existingWs);
+              existingWs.close(1000, 'Replaced by resumed session');
+            }
+          } catch {
+            // ignore
+          }
+        }
+
         meta.id = rotated.participantId;
         meta.roomCode = roomCode;
         meta.isHost = rotated.isHost;
@@ -599,9 +714,13 @@ export class SignalingHub extends DurableObject<Env> {
         meta.deviceType = rotated.deviceType;
         meta.relayPending = undefined;
         meta.relayLedger = undefined;
-        ws.serializeAttachment(meta);
+        this.persistMeta(ws, meta);
 
-        this.saveRoom(roomCode, meta.id);
+        if (meta.isHost) {
+          this.saveRoom(roomCode, meta.id);
+        } else {
+          this.touchRoom(roomCode);
+        }
 
         this.sendJson(ws, {
           type: 'session-resumed',
@@ -623,7 +742,7 @@ export class SignalingHub extends DurableObject<Env> {
         meta.isHost = false;
         meta.relayPending = undefined;
         meta.relayLedger = undefined;
-        ws.serializeAttachment(meta);
+        this.persistMeta(ws, meta);
 
         this.deleteCredential(oldId);
 
@@ -691,40 +810,30 @@ export class SignalingHub extends DurableObject<Env> {
 
           if (payload && typeof payload === 'object' && typeof payload.type === 'string') {
             if (payload.type === 'v2-meta') {
+              if (roomWireVersion(meta.networkVersion, peers.map((p) => p.meta.networkVersion)) !== 2) {
+                this.sendJson(ws, { type: 'error', code: 'RELAY_PROTOCOL_MISMATCH', message: 'Both peers must support v2', ...(typeof payload.transferId === 'string' ? { transferId: payload.transferId } : {}) });
+                ws.serializeAttachment(meta);
+                return;
+              }
               const target = peers[0];
-              const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
-              const fileId = Number(payload.fileId);
-              const size = Number(payload.size);
-              const chunkSize = Number(payload.chunkSize);
-              if (
-                !target ||
-                !transferId ||
-                !Number.isInteger(fileId) ||
-                fileId < 0 ||
-                fileId > 65535 ||
-                !Number.isSafeInteger(size) ||
-                size < 0 ||
-                !Number.isSafeInteger(chunkSize) ||
-                chunkSize < 1 ||
-                chunkSize > MAX_RELAY_FRAME - 8
-              ) {
+              const admission = admitRelayMeta(
+                payload,
+                target?.meta.id,
+                Boolean(meta.relayLedger || meta.relayPending)
+              );
+              if (!admission.ok) {
                 this.sendJson(ws, {
                   type: 'error',
-                  code: 'RELAY_INVALID_META',
-                  message: 'Invalid v2 relay metadata',
-                  transferId,
+                  code: admission.code,
+                  message: admission.code === 'RELAY_BUSY' ? 'Relay transfer already active' : 'Invalid v2 relay metadata',
+                  ...(typeof payload.transferId === 'string' && payload.transferId.length <= 128
+                    ? { transferId: payload.transferId }
+                    : {}),
                 });
                 ws.serializeAttachment(meta);
                 return;
               }
-              meta.relayPending = {
-                transferId,
-                fileId,
-                size,
-                chunkSize,
-                targetId: target.meta.id,
-              };
-              meta.relayLedger = undefined;
+              meta.relayPending = admission.meta;
               ws.serializeAttachment(meta);
               this.sendJson(target.ws, {
                 type: 'relay',
@@ -739,29 +848,46 @@ export class SignalingHub extends DurableObject<Env> {
               const sender = peers.find(
                 (p) => p.meta.relayPending?.transferId === transferId && p.meta.relayPending.targetId === meta.id
               );
-              if (sender && sender.meta.relayPending) {
-                const pend = sender.meta.relayPending;
-                sender.meta.relayPending = undefined;
-                if (payload.ok === true) {
+              if (!sender || !sender.meta.relayPending || typeof payload.ok !== 'boolean') {
+                this.sendJson(ws, {
+                  type: 'error',
+                  code: 'RELAY_INVALID_META',
+                  message: 'Mismatched or unsolicited v2-ready',
+                  ...(transferId ? { transferId } : {}),
+                });
+                return;
+              }
+              const pend = sender.meta.relayPending;
+              if (payload.ok === true) {
+                try {
                   const ledger = openLedger(pend.fileId, pend.size, pend.chunkSize);
+                  sender.meta.relayPending = undefined;
                   sender.meta.relayLedger = {
                     ...ledger,
                     transferId: pend.transferId,
                     targetId: meta.id,
                     totalSize: pend.size,
                   };
-                } else {
-                  sender.meta.relayLedger = undefined;
+                } catch (err) {
+                  this.abortRelayTransfer(
+                    sender.ws,
+                    sender.meta,
+                    err instanceof Error ? err.message : 'Failed to open relay ledger'
+                  );
+                  return;
                 }
-                sender.ws.serializeAttachment(sender.meta);
-                ws.serializeAttachment(meta);
-                this.sendJson(sender.ws, {
-                  type: 'relay',
-                  from: meta.id,
-                  payload: msg.payload,
-                });
-                return;
+              } else {
+                sender.meta.relayPending = undefined;
+                sender.meta.relayLedger = undefined;
               }
+              sender.ws.serializeAttachment(sender.meta);
+              ws.serializeAttachment(meta);
+              this.sendJson(sender.ws, {
+                type: 'relay',
+                from: meta.id,
+                payload: msg.payload,
+              });
+              return;
             }
 
             if (payload.type === 'v2-end') {
@@ -847,38 +973,67 @@ export class SignalingHub extends DurableObject<Env> {
     }
   }
 
+  private terminatedSockets = new WeakSet<WebSocket>();
+
+  private async handleSocketTermination(ws: WebSocket, code: number, reason: string): Promise<void> {
+    if (this.terminatedSockets.has(ws)) return;
+    this.terminatedSockets.add(ws);
+    this.roomsIndex.remove(ws);
+
+    const runCleanup = async () => {
+      let oldRoom = '';
+      let participantId = '';
+      let activeTransferId: string | undefined;
+      try {
+        const meta = ws.deserializeAttachment() as ClientMeta | null;
+        if (meta?.roomCode) {
+          oldRoom = meta.roomCode;
+          participantId = meta.id;
+          activeTransferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
+          meta.relayLedger = undefined;
+          meta.relayPending = undefined;
+          ws.serializeAttachment(meta);
+        }
+      } catch {
+        // Ignore
+      }
+
+      try {
+        ws.close(code, reason);
+      } catch {
+        // Ignore
+      }
+
+      if (oldRoom && participantId) {
+        if (activeTransferId) {
+          this.notifyRoomTransferAborted(oldRoom, participantId, activeTransferId, 'Peer disconnected');
+        }
+        await this.markCredentialGrace(participantId);
+        const remaining = this.getRoomSockets(oldRoom);
+        for (const m of remaining) {
+          this.sendJson(m.ws, {
+            type: 'peer-reconnecting',
+            roomCode: oldRoom,
+            peerId: participantId,
+            graceMs: 60000,
+          });
+        }
+        this.cleanUpRoomIfEmpty(oldRoom);
+      }
+    };
+
+    try {
+      await this.membershipEvents.run(runCleanup);
+    } catch {
+      await runCleanup();
+    }
+  }
+
   /**
    * WebSocket Hibernation API: handle socket disconnection.
    */
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    let oldRoom = '';
-    let participantId = '';
-    let activeTransferId: string | undefined;
-    try {
-      const meta = ws.deserializeAttachment() as ClientMeta | null;
-      if (meta?.roomCode) {
-        oldRoom = meta.roomCode;
-        participantId = meta.id;
-        activeTransferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
-      }
-    } catch {
-      // Ignore
-    }
-
-    try {
-      ws.close(code, reason);
-    } catch {
-      // Ignore
-    }
-
-    if (oldRoom && participantId) {
-      if (activeTransferId) {
-        this.notifyRoomTransferAborted(oldRoom, participantId, activeTransferId, 'Peer disconnected');
-      }
-      await this.markCredentialGrace(participantId);
-      this.broadcastRoomPeers(oldRoom);
-      this.cleanUpRoomIfEmpty(oldRoom);
-    }
+    await this.handleSocketTermination(ws, code, reason);
   }
 
   /**
@@ -891,6 +1046,12 @@ export class SignalingHub extends DurableObject<Env> {
         'DELETE FROM session_credentials WHERE (grace_until > 0 AND grace_until <= ?) OR expires_at <= ?',
         now,
         now
+      );
+
+      this.ctx.storage.sql.exec(
+        'DELETE FROM pin_rate_limits WHERE (blocked_until > 0 AND blocked_until <= ?) AND last_attempt <= ?',
+        now,
+        now - SECURITY_LIMITS.PIN_BLOCK_DURATION_MS
       );
 
       // Clean up any rooms that have neither active sockets nor active grace credentials
@@ -920,6 +1081,7 @@ export class SignalingHub extends DurableObject<Env> {
    */
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.warn('[SignalingHub] WebSocket error event:', error);
+    await this.handleSocketTermination(ws, 1011, 'WebSocket transport error');
   }
 
   // --- Helper Methods ---
@@ -973,21 +1135,14 @@ export class SignalingHub extends DurableObject<Env> {
     }
   }
 
+  private persistMeta(ws: WebSocket, meta: ClientMeta): void {
+    ws.serializeAttachment(meta);
+    this.roomsIndex.update(ws, meta.roomCode);
+  }
+
   private getRoomSockets(roomCode: string): { ws: WebSocket; meta: ClientMeta }[] {
     if (!roomCode) return [];
-    const results: { ws: WebSocket; meta: ClientMeta }[] = [];
-
-    for (const ws of this.ctx.getWebSockets()) {
-      try {
-        const meta = ws.deserializeAttachment() as ClientMeta | null;
-        if (meta && meta.roomCode === roomCode) {
-          results.push({ ws, meta });
-        }
-      } catch {
-        // Ignore uninitialized or stale socket
-      }
-    }
-    return results;
+    return this.roomsIndex.members(roomCode);
   }
 
   private countConnectionsForIp(ip: string): number {
@@ -1029,6 +1184,18 @@ export class SignalingHub extends DurableObject<Env> {
 
   // --- SQLite Storage Operations ---
 
+  private touchRoom(roomCode: string): void {
+    try {
+      this.ctx.storage.sql.exec(
+        'UPDATE rooms SET updated_at = ? WHERE room_code = ?',
+        Date.now(),
+        roomCode
+      );
+    } catch (err) {
+      console.error('[SignalingHub SQLite] Error updating room timestamp:', err);
+    }
+  }
+
   private saveRoom(roomCode: string, hostId: string): void {
     try {
       const now = Date.now();
@@ -1069,10 +1236,14 @@ export class SignalingHub extends DurableObject<Env> {
     try {
       const now = Date.now();
       const rows = this.ctx.storage.sql
-        .exec('SELECT failed_attempts FROM pin_rate_limits WHERE ip = ?', ip)
+        .exec('SELECT failed_attempts, blocked_until, last_attempt FROM pin_rate_limits WHERE ip = ?', ip)
         .toArray();
-      let attempts = rows.length > 0 ? Number((rows[0] as Record<string, unknown>).failed_attempts || 0) : 0;
-      attempts++;
+      const row = rows[0] as Record<string, unknown> | undefined;
+      const blocked = Number(row?.blocked_until || 0);
+      const last = Number(row?.last_attempt || 0);
+      if (blocked > now) return;
+      const expired = (blocked > 0 && blocked <= now) || now - last >= SECURITY_LIMITS.PIN_BLOCK_DURATION_MS;
+      const attempts = (expired ? 0 : Number(row?.failed_attempts || 0)) + 1;
       const blockedUntil =
         attempts >= SECURITY_LIMITS.MAX_PIN_ATTEMPTS
           ? now + SECURITY_LIMITS.PIN_BLOCK_DURATION_MS
@@ -1207,27 +1378,23 @@ export class SignalingHub extends DurableObject<Env> {
   }
 
   private countReservedGraceSlots(roomCode: string, excludeParticipantId?: string): number {
-    try {
-      const now = Date.now();
-      const rows = this.ctx.storage.sql
-        .exec(
-          'SELECT participant_id FROM session_credentials WHERE room_code = ? AND grace_until > ? AND expires_at > ?',
-          roomCode,
-          now,
-          now
-        )
-        .toArray();
-      let count = 0;
-      for (const row of rows) {
-        const pid = String((row as Record<string, unknown>).participant_id || '');
-        if (pid && pid !== excludeParticipantId) {
-          count++;
-        }
+    const now = Date.now();
+    const rows = this.ctx.storage.sql
+      .exec(
+        'SELECT participant_id FROM session_credentials WHERE room_code = ? AND grace_until > ? AND expires_at > ?',
+        roomCode,
+        now,
+        now
+      )
+      .toArray();
+    let count = 0;
+    for (const row of rows) {
+      const pid = String((row as Record<string, unknown>).participant_id || '');
+      if (pid && pid !== excludeParticipantId) {
+        count++;
       }
-      return count;
-    } catch {
-      return 0;
     }
+    return count;
   }
 
   private async validateAndRotateCredential(

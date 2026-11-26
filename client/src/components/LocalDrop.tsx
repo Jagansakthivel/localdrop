@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence, MotionConfig, useReducedMotion } from 'motion/react';
 import { formatFilename } from '../utils/formatFilename';
+import { downloadReceivedFile } from '../utils/saveReceivedFile';
 import {
   ArrowUpRight,
   ArrowDownLeft,
@@ -181,20 +182,18 @@ export default function LocalDrop(p: Props) {
   const [saveHandles, setSaveHandles] = useState<Record<string, SaveFileHandle>>({});
   const [saveStates, setSaveStates] = useState<Record<string, { state: SaveState; filename: string }>>({});
 
-  const getSaveHandle = (t: Transfer) => saveHandles[t.id] || saveHandles[t.name] || null;
+  const getSaveHandle = (t: Transfer) => saveHandles[t.id] || null;
   const setSaveHandle = (t: Transfer, handle: SaveFileHandle) => {
     setSaveHandles((prev) => ({
       ...prev,
       [t.id]: handle,
-      [t.name]: handle,
     }));
   };
-  const getSaveState = (t: Transfer) => saveStates[t.id] || saveStates[t.name];
+  const getSaveState = (t: Transfer) => saveStates[t.id];
   const setSaveStateRecord = (t: Transfer, state: SaveState, savedName: string) => {
     setSaveStates((prev) => ({
       ...prev,
       [t.id]: { state, filename: savedName },
-      [t.name]: { state, filename: savedName },
     }));
   };
 
@@ -259,10 +258,50 @@ export default function LocalDrop(p: Props) {
   }
 
   // Voice recording handler
+  const voiceStreamRef = useRef<MediaStream | null>(null);
+  const voiceUnmountedRef = useRef(false);
+
+  useEffect(() => {
+    voiceUnmountedRef.current = false;
+    return () => {
+      voiceUnmountedRef.current = true;
+      if (voiceTimerRef.current) {
+        clearInterval(voiceTimerRef.current);
+        voiceTimerRef.current = null;
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {
+          // ignore
+        }
+      }
+      if (voiceStreamRef.current) {
+        voiceStreamRef.current.getTracks().forEach((track) => track.stop());
+        voiceStreamRef.current = null;
+      }
+    };
+  }, []);
+
   const startVoiceRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      voiceStreamRef.current = stream;
+
+      const candidates = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/mp4',
+        'audio/ogg;codecs=opus',
+      ];
+      const supportedMime =
+        typeof MediaRecorder.isTypeSupported === 'function'
+          ? candidates.find((m) => MediaRecorder.isTypeSupported(m))
+          : undefined;
+      const recorder = supportedMime
+        ? new MediaRecorder(stream, { mimeType: supportedMime })
+        : new MediaRecorder(stream);
+
       mediaRecorderRef.current = recorder;
       audioChunksRef.current = [];
 
@@ -271,12 +310,41 @@ export default function LocalDrop(p: Props) {
       };
 
       recorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const voiceFile = new File([audioBlob], `Voice-memo-${new Date().toLocaleTimeString().replace(/:/g, '-')}.webm`, {
-          type: 'audio/webm',
+        const actualMime =
+          recorder.mimeType ||
+          audioChunksRef.current[0]?.type ||
+          supportedMime ||
+          'audio/webm';
+        const ext = actualMime.includes('mp4')
+          ? 'm4a'
+          : actualMime.includes('ogg')
+          ? 'ogg'
+          : 'webm';
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const audioBlob = new Blob(audioChunksRef.current, { type: actualMime });
+        const voiceFile = new File([audioBlob], `Voice-memo-${stamp}.${ext}`, {
+          type: actualMime,
         });
-        if (p.onVoiceNote) p.onVoiceNote(voiceFile);
         stream.getTracks().forEach((track) => track.stop());
+        if (voiceStreamRef.current === stream) {
+          voiceStreamRef.current = null;
+        }
+        if (!voiceUnmountedRef.current && p.onVoiceNote && audioBlob.size > 0) {
+          p.onVoiceNote(voiceFile);
+        }
+      };
+
+      recorder.onerror = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        if (voiceStreamRef.current === stream) {
+          voiceStreamRef.current = null;
+        }
+        if (voiceTimerRef.current) {
+          clearInterval(voiceTimerRef.current);
+          voiceTimerRef.current = null;
+        }
+        setRecordingVoice(false);
+        setNotice('Voice recording failed.');
       };
 
       recorder.start();
@@ -286,6 +354,10 @@ export default function LocalDrop(p: Props) {
         setVoiceElapsed((v) => v + 1);
       }, 1000);
     } catch {
+      if (voiceStreamRef.current) {
+        voiceStreamRef.current.getTracks().forEach((track) => track.stop());
+        voiceStreamRef.current = null;
+      }
       setNotice('Microphone access denied or unavailable.');
     }
   };
@@ -294,7 +366,10 @@ export default function LocalDrop(p: Props) {
     if (mediaRecorderRef.current && recordingVoice) {
       mediaRecorderRef.current.stop();
       setRecordingVoice(false);
-      if (voiceTimerRef.current) clearInterval(voiceTimerRef.current);
+      if (voiceTimerRef.current) {
+        clearInterval(voiceTimerRef.current);
+        voiceTimerRef.current = null;
+      }
     }
   };
 
@@ -816,14 +891,14 @@ export default function LocalDrop(p: Props) {
                             </div>
 
                             {item.kind === 'file' && item.file && (
-                              <a
-                                href={URL.createObjectURL(item.file)}
-                                download={item.file.name}
+                              <button
+                                type="button"
+                                onClick={() => downloadReceivedFile(item.file!)}
                                 className="p-2 rounded-xl border border-[var(--line)] hover:bg-[var(--line)] text-inherit"
                                 aria-label="Download file"
                               >
                                 <Download size={15} />
-                              </a>
+                              </button>
                             )}
                           </div>
                         ))}

@@ -117,18 +117,33 @@ function countReservedGraceSlots(roomCode: string, excludeParticipantId?: string
   return count;
 }
 
+const trustedProxyIps = new Set(
+  (process.env.TRUSTED_PROXY_IPS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+);
+
 function getClientIp(req: http.IncomingMessage): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim();
+  const remoteIp = req.socket.remoteAddress || '127.0.0.1';
+  if (trustedProxyIps.has(remoteIp)) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string') {
+      const first = forwarded.split(',')[0].trim();
+      if (first) return first;
+    }
   }
-  return req.socket.remoteAddress || '127.0.0.1';
+  return remoteIp;
 }
 
 function isOriginAllowed(originHeader?: string): boolean {
   if (!originHeader) return true; // Non-browser clients, tests, or same-origin
   try {
     const originUrl = new URL(originHeader);
+    if (originUrl.protocol !== 'http:' && originUrl.protocol !== 'https:') {
+      return false;
+    }
+    const normalizedOrigin = originUrl.origin.toLowerCase();
     const host = originUrl.hostname.toLowerCase();
 
     // Local development & LAN
@@ -144,17 +159,21 @@ function isOriginAllowed(originHeader?: string): boolean {
       return true;
     }
 
-    // Vercel production and preview deployments
-    if (host === 'vercel.app' || host.endsWith('.vercel.app')) {
-      return true;
-    }
+    const effectiveAllowed =
+      customAllowedOrigins.length > 0
+        ? customAllowedOrigins
+        : ['https://client-taupe-one-79.vercel.app'];
 
-    // Custom allowed origins from environment variable
-    if (customAllowedOrigins.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))) {
-      return true;
-    }
-
-    return false;
+    return effectiveAllowed.some((allowed) => {
+      if (allowed.startsWith('http://') || allowed.startsWith('https://')) {
+        try {
+          return new URL(allowed).origin.toLowerCase() === normalizedOrigin;
+        } catch {
+          return false;
+        }
+      }
+      return host === allowed;
+    });
   } catch {
     return false;
   }
@@ -284,13 +303,59 @@ wss.on('connection', (ws, req) => {
   };
   clients.set(id, client);
 
-  // Send initial welcome message with client ID
-  ws.send(JSON.stringify({ type: 'welcome', id, networkVersion: 2, v2Supported: true }));
+  let binaryTokens = 4 * 1024 * 1024;
+  let lastBinaryRefill = Date.now();
+  const BINARY_RATE_BYTES_PER_SEC = 30 * 1024 * 1024;
+  const BINARY_BURST_BYTES = 4 * 1024 * 1024;
+
+  // Node dev server implements bounded v1 relay (no v2 Durable Object ledger)
+  ws.send(JSON.stringify({ type: 'welcome', id, networkVersion: 1, v2Supported: false }));
 
   ws.on('message', (raw, isBinary) => {
     aliveClients.set(ws, true);
 
-    // Rate limiting: check messages per second
+    // Forward binary file chunks outside JSON rate limit, using dedicated byte-rate bucket
+    if (isBinary) {
+      if (!client.roomCode) return;
+
+      const rawBuffer = raw as Buffer;
+      if (rawBuffer.length > MAX_BINARY_CHUNK_BYTES) {
+        ws.send(
+          JSON.stringify({
+            type: 'error',
+            code: 'PAYLOAD_TOO_LARGE',
+            message: 'Binary chunk exceeds maximum allowed size',
+          })
+        );
+        return;
+      }
+
+      const nowBin = Date.now();
+      const elapsedSec = Math.max(0, (nowBin - lastBinaryRefill) / 1000);
+      lastBinaryRefill = nowBin;
+      binaryTokens = Math.min(BINARY_BURST_BYTES, binaryTokens + elapsedSec * BINARY_RATE_BYTES_PER_SEC);
+      if (binaryTokens < rawBuffer.length) {
+        ws.send(
+          JSON.stringify({
+            type: 'error',
+            code: 'RATE_LIMIT_EXCEEDED',
+            message: 'Binary relay bandwidth quota exceeded',
+          })
+        );
+        return;
+      }
+      binaryTokens -= rawBuffer.length;
+
+      const peers = getRoomMembers(client.roomCode);
+      for (const peer of peers) {
+        if (peer.id !== client.id && peer.ws.readyState === WebSocket.OPEN) {
+          peer.ws.send(raw, { binary: true });
+        }
+      }
+      return;
+    }
+
+    // Rate limiting: check JSON control messages per second
     const now = Date.now();
     if (now - client.lastMessageReset > 1000) {
       client.messageCount = 1;
@@ -307,25 +372,6 @@ wss.on('connection', (ws, req) => {
         );
         return;
       }
-    }
-
-    // Forward binary file chunks directly to the paired peer in the same room
-    if (isBinary) {
-      if (!client.roomCode) return;
-
-      const rawBuffer = raw as Buffer;
-      if (rawBuffer.length > MAX_BINARY_CHUNK_BYTES) {
-        console.warn(`[LocalDrop Server] Binary chunk exceeded max limit (${rawBuffer.length} bytes)`);
-        return;
-      }
-
-      const peers = getRoomMembers(client.roomCode);
-      for (const peer of peers) {
-        if (peer.id !== client.id && peer.ws.readyState === WebSocket.OPEN) {
-          peer.ws.send(raw, { binary: true });
-        }
-      }
-      return;
     }
 
     // Enforce JSON size limit
@@ -400,6 +446,31 @@ wss.on('connection', (ws, req) => {
             type: 'room-error',
             code: 'INVALID_PIN',
             message: 'Room code must be a 4-digit PIN',
+          })
+        );
+        return;
+      }
+
+      const existingOccupants = getRoomMembers(roomCode).filter((m) => m.id !== client.id);
+      const now = Date.now();
+      let hasReservedGrace = false;
+      for (const cred of sessionCredentials.values()) {
+        if (
+          cred.roomCode === roomCode &&
+          cred.participantId !== client.id &&
+          cred.graceUntil > now &&
+          cred.expiresAt > now
+        ) {
+          hasReservedGrace = true;
+          break;
+        }
+      }
+      if (existingOccupants.length > 0 || hasReservedGrace) {
+        ws.send(
+          JSON.stringify({
+            type: 'room-error',
+            code: 'ROOM_TAKEN',
+            message: 'PIN already in use',
           })
         );
         return;

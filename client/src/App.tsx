@@ -5,10 +5,24 @@ import { Toaster, toast } from 'sonner';
 import { usePeerDrop } from './hooks/usePeerDrop';
 import LocalDrop, { type Transfer, type StagedItem } from './components/LocalDrop';
 import { normalizeFiles, formatBytes } from './utils/fileAdapter';
+import { uniqueExportName, isPdf } from './utils/fileSafety';
+import { sendLiveBatch } from './network-v2/batchSafety';
+import { removePairingPin } from './utils/diagnosticsSafety';
 import { resolveWebSocketUrl } from './utils/network';
 import './localdrop.css';
 
-const WS_URL = resolveWebSocketUrl();
+function getInitialWsConfig(): { url: string; error: string | null } {
+  try {
+    return { url: resolveWebSocketUrl(), error: null };
+  } catch (err) {
+    return {
+      url: '',
+      error: err instanceof Error ? err.message : 'Invalid signaling server URL configuration',
+    };
+  }
+}
+
+const WS_CONFIG = getInitialWsConfig();
 
 export default function App() {
   const {
@@ -32,10 +46,23 @@ export default function App() {
     acceptIncomingFile,
     declineIncomingFile,
     cancelTransfer,
-  } = usePeerDrop(WS_URL);
+  } = usePeerDrop(WS_CONFIG.url);
+
+  useEffect(() => {
+    if (WS_CONFIG.error) {
+      toast.error(WS_CONFIG.error);
+    }
+  }, []);
 
   const [stagedFiles, setStagedFiles] = useState<StagedItem[]>([]);
-  const [isSendingBatch, setIsSendingBatch] = useState(false);
+  const stagedFilesRef = useRef<StagedItem[]>(stagedFiles);
+  stagedFilesRef.current = stagedFiles;
+  const [, setIsSendingBatch] = useState(false);
+  const batchLockRef = useRef(false);
+  const batchSessionRef = useRef(0);
+  const batchAbortRef = useRef<AbortController | null>(null);
+  const connectedPeerRef = useRef(connectedPeer);
+  connectedPeerRef.current = connectedPeer;
   const [channelSessionId, setChannelSessionId] = useState<string | null>(null);
   const lastPeerIdRef = useRef<string | null>(null);
   const autoPairAttemptedRef = useRef<string | null>(null);
@@ -44,10 +71,13 @@ export default function App() {
     if (connectedPeer) {
       if (lastPeerIdRef.current !== connectedPeer.id) {
         lastPeerIdRef.current = connectedPeer.id;
+        batchSessionRef.current += 1;
         setChannelSessionId(connectedPeer.id || crypto.randomUUID());
       }
     } else if (connectionState === 'waiting' || connectionState === 'offline' || connectionState === 'failed') {
       lastPeerIdRef.current = null;
+      batchSessionRef.current += 1;
+      batchAbortRef.current?.abort(new Error('Session ended'));
       setChannelSessionId(null);
     }
   }, [connectedPeer, connectionState]);
@@ -62,6 +92,15 @@ export default function App() {
     if (autoPairAttemptedRef.current === urlPin) return;
 
     autoPairAttemptedRef.current = urlPin;
+    try {
+      window.history.replaceState(
+        window.history.state,
+        '',
+        removePairingPin(window.location.href)
+      );
+    } catch {
+      // ignore history errors
+    }
     connectWithPin(urlPin);
   }, [wsConnected, connectedPeer, connectWithPin]);
 
@@ -75,32 +114,55 @@ export default function App() {
   const handleFiles = useCallback((incoming: unknown) => {
     const normalized = normalizeFiles(incoming);
     if (!normalized.length) return;
-    setStagedFiles((prev) => [...prev, ...normalized]);
+    setStagedFiles((prev) => {
+      const next = [...prev, ...normalized];
+      stagedFilesRef.current = next;
+      return next;
+    });
     toast.success(`Staged ${normalized.length} ${normalized.length === 1 ? 'file' : 'files'}`);
   }, []);
 
   // Send all staged files sequentially with real acknowledgement verification
   const handleSendStaged = async () => {
-    if (!connectedPeer || stagedFiles.length === 0 || isSendingBatch) return;
+    if (!connectedPeerRef.current || stagedFilesRef.current.length === 0 || batchLockRef.current) return;
+    batchLockRef.current = true;
     setIsSendingBatch(true);
-    const queue = [...stagedFiles];
+    const sessionToken = batchSessionRef.current;
+    const ac = new AbortController();
+    batchAbortRef.current = ac;
+    const queue = [...stagedFilesRef.current];
 
-    for (let i = 0; i < queue.length; i++) {
-      const item = queue[i];
-      try {
-        const success = await sendFile(item.file);
-        if (!success) {
-          toast.error(`Transfer cancelled or declined: ${item.name}`);
-          break;
-        }
-        setStagedFiles((prev) => prev.filter((sf) => sf.id !== item.id));
-      } catch (err) {
+    try {
+      await sendLiveBatch({
+        initial: queue,
+        live: () => stagedFilesRef.current,
+        sameSession: () => batchSessionRef.current === sessionToken && Boolean(connectedPeerRef.current),
+        signal: ac.signal,
+        send: async (item) => {
+          const ok = await sendFile(item.file);
+          if (!ok) {
+            toast.error(`Transfer cancelled or declined: ${item.name}`);
+          }
+          return ok;
+        },
+        onSent: (item) => {
+          setStagedFiles((prev) => {
+            const next = prev.filter((sf) => sf.id !== item.id);
+            stagedFilesRef.current = next;
+            return next;
+          });
+        },
+      });
+    } catch (err) {
+      if (!ac.signal.aborted) {
         console.error('Failed sending staged file:', err);
-        toast.error(`Error sending ${item.name}`);
-        break;
+        toast.error('Batch transfer interrupted');
       }
+    } finally {
+      if (batchAbortRef.current === ac) batchAbortRef.current = null;
+      batchLockRef.current = false;
+      setIsSendingBatch(false);
     }
-    setIsSendingBatch(false);
   };
 
   // Folder zip and stage
@@ -115,30 +177,34 @@ export default function App() {
       const fileList = input.files;
       if (!fileList || fileList.length === 0) return;
 
-      toast.info('Compressing directory into ZIP archive...');
-      const zip = new JSZip();
-      let topFolder = 'Archive';
+      try {
+        toast.info('Compressing directory into ZIP archive...');
+        const zip = new JSZip();
+        let topFolder = 'Archive';
 
-      for (let i = 0; i < fileList.length; i++) {
-        const f = fileList[i];
-        const relativePath = f.webkitRelativePath || f.name;
-        if (i === 0 && f.webkitRelativePath) {
-          topFolder = f.webkitRelativePath.split('/')[0] || 'Archive';
+        for (let i = 0; i < fileList.length; i++) {
+          const f = fileList[i];
+          const relativePath = f.webkitRelativePath || f.name;
+          if (i === 0 && f.webkitRelativePath) {
+            topFolder = f.webkitRelativePath.split('/')[0] || 'Archive';
+          }
+          zip.file(relativePath, f);
         }
-        zip.file(relativePath, f);
+
+        const zipBlob = await zip.generateAsync({
+          type: 'blob',
+          compression: 'DEFLATE',
+          compressionOptions: { level: 6 },
+        });
+
+        const zipFile = new File([zipBlob], `${topFolder}.zip`, {
+          type: 'application/zip',
+        });
+
+        handleFiles([zipFile]);
+      } catch {
+        toast.error('Failed compressing folder');
       }
-
-      const zipBlob = await zip.generateAsync({
-        type: 'blob',
-        compression: 'DEFLATE',
-        compressionOptions: { level: 6 },
-      });
-
-      const zipFile = new File([zipBlob], `${topFolder}.zip`, {
-        type: 'application/zip',
-      });
-
-      handleFiles([zipFile]);
     };
 
     input.click();
@@ -151,22 +217,25 @@ export default function App() {
 
     toast.info('Packaging session items into ZIP...');
     const zip = new JSZip();
+    const usedNames = new Set<string>();
     files.forEach((item) => {
-      if (item.file) zip.file(item.file.name, item.file);
+      if (item.file) zip.file(uniqueExportName(item.file.name, usedNames), item.file);
     });
 
     const content = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(content);
     const link = document.createElement('a');
-    link.href = URL.createObjectURL(content);
+    link.href = url;
     link.download = `LocalDrop-Session-${Date.now()}.zip`;
     link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
     toast.success('ZIP download started');
   };
 
   // Merge PDFs
   const handleMergePdfs = async () => {
     const pdfs = sharedItems.filter(
-      (item) => item.kind === 'file' && item.file && item.file.type === 'application/pdf'
+      (item) => item.kind === 'file' && item.file && isPdf(item.file)
     );
     if (pdfs.length < 2) {
       toast.info('Need at least 2 PDF documents in session vault to merge');
@@ -187,10 +256,12 @@ export default function App() {
 
       const out = await merged.save();
       const blob = new Blob([out as unknown as BlobPart], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
+      link.href = url;
       link.download = `Merged-LocalDrop-${Date.now()}.pdf`;
       link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
       toast.success('Merged PDF generated');
     } catch {
       toast.error('Failed merging PDFs');
@@ -278,16 +349,29 @@ export default function App() {
         onDisconnect={disconnect}
         onFiles={handleFiles}
         onClipboard={(text) => {
-          sendTextOrLink(text);
-          toast.success('Text beamed to peer');
+          if (sendTextOrLink(text)) {
+            toast.success('Text beamed to peer');
+          } else {
+            toast.error('Failed to send text');
+          }
         }}
         onCancel={() => {
           cancelTransfer();
           toast.info('Transfer cancelled');
         }}
         onFolder={handleFolderSelect}
-        onRemoveStaged={(id) => setStagedFiles((prev) => prev.filter((sf) => sf.id !== id))}
-        onClearStaged={() => setStagedFiles([])}
+        onRemoveStaged={(id) => {
+          setStagedFiles((prev) => {
+            const next = prev.filter((sf) => sf.id !== id);
+            stagedFilesRef.current = next;
+            return next;
+          });
+        }}
+        onClearStaged={() => {
+          batchAbortRef.current?.abort(new Error('Batch cleared'));
+          stagedFilesRef.current = [];
+          setStagedFiles([]);
+        }}
         onSendStaged={handleSendStaged}
         onVoiceNote={(voiceFile) => {
           handleFiles([voiceFile]);

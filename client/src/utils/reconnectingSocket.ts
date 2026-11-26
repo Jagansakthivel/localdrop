@@ -1,3 +1,5 @@
+import { attachHeartbeat } from './heartbeat';
+
 interface SocketHandlers {
   onOpen: (socket: WebSocket) => void;
   onMessage: (event: MessageEvent) => void;
@@ -10,10 +12,25 @@ interface SocketHandlers {
 export function createReconnectingSocket(url: string, handlers: SocketHandlers) {
   let socket: WebSocket | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let stopHeartbeat: (() => void) | null = null;
   let stopped = false;
   let attempts = 0;
   let generation = 0;
   const MAX_ATTEMPTS = 15;
+
+  function scheduleReconnect() {
+    if (stopped) return;
+    if (attempts >= MAX_ATTEMPTS) {
+      handlers.onExhausted?.();
+      return;
+    }
+    // Bounded exponential backoff with jitter (cap 15s)
+    const delay = Math.min(1000 * 1.5 ** attempts, 15000) + Math.floor(Math.random() * 250);
+    attempts++;
+    handlers.onReconnect?.(attempts, delay);
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(connect, delay);
+  }
 
   function connect() {
     if (stopped) return;
@@ -32,6 +49,15 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
       current.onopen = () => {
         if (stopped || myGeneration !== generation || socket !== current) return;
         attempts = 0;
+        stopHeartbeat?.();
+        stopHeartbeat = attachHeartbeat(current, () => {
+          if (stopped || myGeneration !== generation || socket !== current) return;
+          try {
+            current.close(4000, 'Heartbeat timeout');
+          } catch {
+            // ignore
+          }
+        });
         handlers.onOpen(current);
       };
 
@@ -47,24 +73,19 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
 
       current.onclose = (event) => {
         if (stopped || myGeneration !== generation || socket !== current) return;
+        stopHeartbeat?.();
+        stopHeartbeat = null;
         socket = null;
         handlers.onClose(event);
-
-        if (attempts >= MAX_ATTEMPTS) {
-          handlers.onExhausted?.();
-          return;
-        }
-
-        // Bounded exponential backoff with jitter (cap 15s)
-        const delay = Math.min(1000 * 1.5 ** attempts, 15000) + Math.floor(Math.random() * 250);
-        attempts++;
-        handlers.onReconnect?.(attempts, delay);
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(connect, delay);
+        scheduleReconnect();
       };
     } catch (err) {
       if (!stopped && myGeneration === generation) {
+        stopHeartbeat?.();
+        stopHeartbeat = null;
+        socket = null;
         handlers.onError(err as Event);
+        scheduleReconnect();
       }
     }
   }

@@ -9,7 +9,10 @@ export async function iceServersResponse(request:Request,env:TurnEnv,authorize:A
   if(request.method==='OPTIONS')return new Response(null,{status:204,headers:{...headers,'Access-Control-Allow-Methods':'POST, OPTIONS','Access-Control-Allow-Headers':'Authorization, Content-Type'}});
   if(request.method!=='POST')return respond({error:'Method not allowed'},405);
   if(!env.TURN_KEY_ID||!env.TURN_API_TOKEN)return respond({iceServers:STUN});
-  const token=request.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{32,256})$/)?.[1];const ip=request.headers.get('CF-Connecting-IP');
+  const token=request.headers.get('Authorization')?.match(/^Bearer ([A-Za-z0-9_-]{32,256})$/)?.[1];
+  const reqHost=new URL(request.url).hostname.toLowerCase();
+  const isLocal=reqHost==='localhost'||reqHost==='127.0.0.1';
+  const ip=request.headers.get('CF-Connecting-IP')||(isLocal?(request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()||'127.0.0.1'):null);
   if(!token||!ip)return respond({error:'Unauthorized'},401);
   let room:string;try{const raw=await request.text();if(raw.length>1024)return respond({error:'Invalid request'},400);const parsed:unknown=JSON.parse(raw);if(!parsed||typeof parsed!=='object'||!('roomCode' in parsed)||typeof parsed.roomCode!=='string'||!/^\d{4}$/.test(parsed.roomCode))return respond({error:'Invalid room'},400);room=parsed.roomCode;}catch{return respond({error:'Invalid request'},400);}
   if(!await authorize(room,token,ip))return respond({error:'Unauthorized or quota exceeded'},403);

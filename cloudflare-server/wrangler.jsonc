@@ -21,7 +21,8 @@
     }
   ],
   "vars": {
-    "ALLOWED_ORIGINS": ""
+    "ALLOWED_ORIGINS": "https://client-taupe-one-79.vercel.app",
+    "TURN_ALLOWED_ORIGINS": "https://client-taupe-one-79.vercel.app"
   },
   "observability": {
     "enabled": true

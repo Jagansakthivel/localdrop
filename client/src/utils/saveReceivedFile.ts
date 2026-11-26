@@ -1,3 +1,6 @@
+import { sanitizeSuggestedFilename } from "./saveName";
+import { Sha256 } from "../network-v2/sha256";
+
 interface WritableFileStream {
   write(data: Blob): Promise<void>;
   close(): Promise<void>;
@@ -45,7 +48,7 @@ export async function chooseSaveLocation(
 
   try {
     return await browser.showSaveFilePicker!({
-      suggestedName: filename,
+      suggestedName: sanitizeSuggestedFilename(filename),
       startIn: "downloads",
     });
   } catch (error) {
@@ -91,15 +94,31 @@ export async function writeReceivedFile(
   }
 }
 
+const activeBlobUrls = new Set<string>();
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => {
+    for (const u of activeBlobUrls) {
+      try {
+        URL.revokeObjectURL(u);
+      } catch {
+        // ignore
+      }
+    }
+    activeBlobUrls.clear();
+  });
+}
+
 export function downloadReceivedFile(
   file: File
 ): SaveResult {
+  const safeName = sanitizeSuggestedFilename(file.name);
   const url = URL.createObjectURL(file);
+  activeBlobUrls.add(url);
 
   const link = document.createElement("a");
 
   link.href = url;
-  link.download = file.name;
+  link.download = safeName;
   link.style.display = "none";
 
   try {
@@ -108,7 +127,7 @@ export function downloadReceivedFile(
 
     return {
       status: "download-started",
-      filename: file.name,
+      filename: safeName,
     };
   } catch (error) {
     return {
@@ -122,16 +141,20 @@ export function downloadReceivedFile(
     link.remove();
 
     setTimeout(() => {
+      activeBlobUrls.delete(url);
       URL.revokeObjectURL(url);
-    }, 30000);
+    }, 300000);
   }
 }
 
 export async function computeFileSha256(file: Blob | File): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  const sha = new Sha256();
+  const chunkSize = 1024 * 1024;
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    const buf = await file.slice(offset, offset + chunkSize).arrayBuffer();
+    sha.update(new Uint8Array(buf));
+  }
+  return sha.digest();
 }
 
 export async function saveReceivedFile(

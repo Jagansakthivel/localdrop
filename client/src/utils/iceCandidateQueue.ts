@@ -1,10 +1,19 @@
 export class IceCandidateQueue {
   private candidates: RTCIceCandidateInit[] = [];
+  private settingRemote = false;
+
+  beginRemoteDescription(): void {
+    this.settingRemote = true;
+  }
+
+  endRemoteDescription(): void {
+    this.settingRemote = false;
+  }
 
   async add(pc: RTCPeerConnection, candidate: RTCIceCandidateInit): Promise<void> {
     if (pc.signalingState === 'closed') return;
 
-    if (!pc.remoteDescription) {
+    if (!pc.remoteDescription || this.settingRemote) {
       this.candidates.push(candidate);
       return;
     }

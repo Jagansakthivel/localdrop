@@ -61,6 +61,7 @@ export type ServerMessage =
   | { type: 'session-resumed'; roomCode: string; participantId: string; isHost: boolean; resumeToken: string }
   | { type: 'room-peers'; roomCode: string; peers: PeerInfo[] }
   | { type: 'peer-joined-room'; roomCode: string; peer: PeerInfo }
+  | { type: 'peer-reconnecting'; roomCode: string; peerId: string; graceMs: number }
   | { type: 'room-error'; code: string; message: string }
   | { type: 'signal'; from: string; fromName: string; fromDeviceType: string; signal: unknown }
   | { type: 'v2-path'; from: string; epoch: string; path: 'rtc' | 'relay'; stage: string }

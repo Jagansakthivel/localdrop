@@ -124,18 +124,21 @@ export function useSafeThumbnails(files: NormalizedFile[]): Record<string, strin
 
     activeUrlsRef.current = nextUrls;
     setThumbnails(newThumbnails);
+  }, [files]);
 
+  useEffect(() => {
+    const urlsRef = activeUrlsRef;
     return () => {
-      // Cleanup on unmount
-      nextUrls.forEach((url) => {
+      urlsRef.current.forEach((url) => {
         try {
           URL.revokeObjectURL(url);
         } catch {
           // ignore revoke failure
         }
       });
+      urlsRef.current.clear();
     };
-  }, [files]);
+  }, []);
 
   return thumbnails;
 }
