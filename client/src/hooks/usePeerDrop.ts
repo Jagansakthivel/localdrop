@@ -205,8 +205,12 @@ export function usePeerDrop(wsUrl: string) {
     Map<string, { name: string; size: number; mime: string; at: number }>
   >(new Map());
   const incomingOfferRef = useRef<boolean>(false);
-  const earlySignalsRef = useRef<Array<{ msg: Record<string, unknown>; at: number }>>([]);
-  const earlyPathMsgsRef = useRef<Array<{ msg: Record<string, unknown>; at: number }>>([]);
+  const earlySignalsRef = useRef<
+    Array<{ msg: Record<string, unknown>; peerId: string; generation: number; at: number }>
+  >([]);
+  const earlyPathMsgsRef = useRef<
+    Array<{ msg: Record<string, unknown>; peerId: string; generation: number; at: number }>
+  >([]);
   const rtcTraceRef = useRef<ReturnType<typeof createWebRtcTrace> | null>(null);
   if (!rtcTraceRef.current) {
     rtcTraceRef.current = createWebRtcTrace();
@@ -460,13 +464,16 @@ export function usePeerDrop(wsUrl: string) {
 
     iceQueueRef.current.clear();
     signalsRef.current?.reset();
-    earlySignalsRef.current = [];
-    earlyPathMsgsRef.current = [];
     if (relayPingIntervalRef.current) {
       clearInterval(relayPingIntervalRef.current);
       relayPingIntervalRef.current = null;
     }
     negotiatingPeerIdRef.current = null;
+  }, []);
+
+  const clearEarlyBuffers = useCallback(() => {
+    earlySignalsRef.current = [];
+    earlyPathMsgsRef.current = [];
   }, []);
 
   // Teardown WebRTC peer resources + agreement/race cleanly
@@ -1259,6 +1266,76 @@ export function usePeerDrop(wsUrl: string) {
     [teardownPeerConnection, closeRtcResources, sendSignal, setupDataChannel, attachV2Channel, fallbackToRelay, isV2Active]
   );
 
+  const enqueueSignal = useCallback(
+    (
+      pc: RTCPeerConnection,
+      peerId: string,
+      gen: number,
+      signal: { sdp?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+    ) => {
+      signalsRef.current?.enqueue(async (current) => {
+        const valid = () =>
+          current() &&
+          pcRef.current === pc &&
+          gen === sessionGenerationRef.current &&
+          pc.signalingState !== 'closed';
+        if (!valid()) return;
+
+        if (signal?.sdp) {
+          try {
+            rtcTraceRef.current?.mark(
+              signal.sdp.type === 'offer' ? 'offer-received' : 'answer-received'
+            );
+            const polite = myIdRef.current > peerId;
+            if (signal.sdp.type === 'offer' && pc.signalingState === 'have-local-offer') {
+              if (!polite) return;
+              await pc.setLocalDescription({ type: 'rollback' });
+              if (!valid()) return;
+            }
+            iceQueueRef.current.beginRemoteDescription();
+            try {
+              await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+            } finally {
+              iceQueueRef.current.endRemoteDescription();
+            }
+            if (!valid()) return;
+            rtcTraceRef.current?.mark('remote-desc-set', { type: signal.sdp.type ?? 'unknown' });
+            await iceQueueRef.current.flush(pc);
+            if (!valid()) return;
+
+            if (signal.sdp.type === 'offer') {
+              const answer = await pc.createAnswer();
+              if (!valid()) return;
+              rtcTraceRef.current?.mark('answer-created');
+              await pc.setLocalDescription(answer);
+              if (!valid()) return;
+              rtcTraceRef.current?.mark('answer-sent');
+              callbacksRef.current.sendSignal(peerId, { sdp: pc.localDescription });
+            } else if (signal.sdp.type === 'answer') {
+              profilerRef.current?.mark('answer installed');
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : 'SDP error';
+            networkLog('Error handling remote SDP signal:', err);
+            rtcTraceRef.current?.mark('sdp-error', { reason: msg });
+            if (isV2Active()) {
+              raceRef.current?.check();
+            } else {
+              callbacksRef.current.fallbackToRelay();
+            }
+          }
+        } else if (signal?.candidate) {
+          rtcTraceRef.current?.mark('ice-candidate-remote', {
+            type: extractCandidateType(signal.candidate.candidate || ''),
+          });
+          await iceQueueRef.current.add(pc, signal.candidate);
+          rtcTraceRef.current?.mark('ice-candidate-applied');
+        }
+      });
+    },
+    [isV2Active]
+  );
+
   // Deterministic WebRTC negotiation: designated initiator starts offer
   const startNegotiation = useCallback(
     async (peer: PeerInfo, isInitiator: boolean) => {
@@ -1279,7 +1356,7 @@ export function usePeerDrop(wsUrl: string) {
       if (turnFetchPromiseRef.current) {
         await Promise.race([
           turnFetchPromiseRef.current,
-          new Promise<void>((resolve) => setTimeout(resolve, 1200)),
+          new Promise<void>((resolve) => setTimeout(resolve, 2500)),
         ]);
       }
       if (genBeforeTurn !== sessionGenerationRef.current) {
@@ -1354,6 +1431,7 @@ export function usePeerDrop(wsUrl: string) {
           },
           invalidate: (err) => {
             networkLog('Path agreement invalidated:', err.message);
+            rtcTraceRef.current?.mark('path-invalidated', { reason: err.message });
             if (agreementRef.current === agreement) {
               raceRef.current?.stop();
               raceRef.current = null;
@@ -1374,17 +1452,27 @@ export function usePeerDrop(wsUrl: string) {
               resilienceRef.current?.notify();
             }
           },
+          onTrace: (event, detail) => {
+            rtcTraceRef.current?.mark(`path-${event}`, detail);
+          },
           signal: ac.signal,
         });
         agreementRef.current = agreement;
         if (earlyPathMsgsRef.current.length > 0) {
           const now = Date.now();
-          const queuedPath = earlyPathMsgsRef.current.splice(0);
-          for (const entry of queuedPath) {
-            if (now - entry.at <= 5_000 && entry.msg.from === peer.id) {
+          const remaining: typeof earlyPathMsgsRef.current = [];
+          for (const entry of earlyPathMsgsRef.current.splice(0)) {
+            if (
+              now - entry.at <= 10_000 &&
+              entry.peerId === peer.id &&
+              entry.generation === genAtStart
+            ) {
               agreement.receive(entry.msg);
+            } else if (now - entry.at <= 10_000 && entry.generation === genAtStart) {
+              remaining.push(entry);
             }
           }
+          earlyPathMsgsRef.current = remaining;
         }
 
         if (isInitiator) {
@@ -1448,57 +1536,16 @@ export function usePeerDrop(wsUrl: string) {
       // Drain any signals that arrived while TURN fetch / PeerConnection creation was pending
       if (earlySignalsRef.current.length > 0 && pcRef.current === pc && pc.signalingState !== 'closed') {
         const now = Date.now();
-        const queued = earlySignalsRef.current.splice(0);
         const gen = sessionGenerationRef.current;
+        const queued = earlySignalsRef.current.splice(0);
         for (const entry of queued) {
-          if (now - entry.at > 5_000) continue;
-          const queuedMsg = entry.msg;
-          if (queuedMsg.from === peer.id) {
-            const sig = queuedMsg.signal as {
-              sdp?: RTCSessionDescriptionInit;
-              candidate?: RTCIceCandidateInit;
-            };
-            signalsRef.current?.enqueue(async (current) => {
-              const valid = () =>
-                current() &&
-                pcRef.current === pc &&
-                gen === sessionGenerationRef.current &&
-                pc.signalingState !== 'closed';
-              if (!valid()) return;
-              if (sig?.sdp) {
-                try {
-                  const polite = myIdRef.current > peer.id;
-                  if (sig.sdp.type === 'offer' && pc.signalingState === 'have-local-offer') {
-                    if (!polite) return;
-                    await pc.setLocalDescription({ type: 'rollback' });
-                    if (!valid()) return;
-                  }
-                  iceQueueRef.current.beginRemoteDescription();
-                  try {
-                    await pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
-                  } finally {
-                    iceQueueRef.current.endRemoteDescription();
-                  }
-                  if (!valid()) return;
-                  await iceQueueRef.current.flush(pc);
-                  if (!valid()) return;
-                  if (sig.sdp.type === 'offer') {
-                    const answer = await pc.createAnswer();
-                    if (!valid()) return;
-                    await pc.setLocalDescription(answer);
-                    if (!valid()) return;
-                    callbacksRef.current.sendSignal(peer.id, { sdp: pc.localDescription });
-                  }
-                } catch (err) {
-                  networkLog('Error handling early queued SDP signal:', err);
-                  if (isV2Active()) raceRef.current?.check();
-                  else callbacksRef.current.fallbackToRelay();
-                }
-              } else if (sig?.candidate) {
-                await iceQueueRef.current.add(pc, sig.candidate);
-              }
-            });
-          }
+          if (now - entry.at > 10_000) continue;
+          if (entry.peerId !== peer.id || entry.generation !== gen) continue;
+          const sig = entry.msg.signal as {
+            sdp?: RTCSessionDescriptionInit;
+            candidate?: RTCIceCandidateInit;
+          };
+          enqueueSignal(pc, peer.id, gen, sig);
         }
       }
     },
@@ -1509,6 +1556,7 @@ export function usePeerDrop(wsUrl: string) {
       markConnected,
       updateDiagnostics,
       attachV2Channel,
+      enqueueSignal,
       setupDataChannel,
       sendSignal,
       fallbackToRelay,
@@ -1558,6 +1606,10 @@ export function usePeerDrop(wsUrl: string) {
       const promise = fetchIceServersWithExpiry(wsUrl, token, roomCode, ac.signal)
         .then((res) => {
           if (mountGen === sessionGenerationRef.current && res.iceServers.length > 0) {
+            rtcTraceRef.current?.mark('turn-done', {
+              status: res.status,
+              iceServersCount: res.iceServers.length,
+            });
             iceServersRef.current = res.iceServers;
             if (res.expiresAt !== null) {
               turnExpiresAtRef.current = res.expiresAt;
@@ -1971,6 +2023,7 @@ export function usePeerDrop(wsUrl: string) {
             peerNetworkVersionRef.current = 1;
             authenticatedSessionRef.current = false;
             directEstablishedRef.current = false;
+            clearEarlyBuffers();
             callbacksRef.current.teardownPeerConnection();
             setConnectedPeer(null);
             setConnectionState('waiting');
@@ -2022,54 +2075,6 @@ export function usePeerDrop(wsUrl: string) {
 
             const isInitiator = myIdRef.current < peer.id;
             callbacksRef.current.startNegotiation(peer, isInitiator);
-            if (earlySignalsRef.current.length > 0) {
-              const now = Date.now();
-              const queued = earlySignalsRef.current.splice(0);
-              const gen = sessionGenerationRef.current;
-              const pc = pcRef.current;
-              for (const entry of queued) {
-                if (now - entry.at > 5_000) continue;
-                const queuedMsg = entry.msg;
-                if (queuedMsg.from === peer.id && pc && pc.signalingState !== 'closed') {
-                  const sig = queuedMsg.signal as {
-                    sdp?: RTCSessionDescriptionInit;
-                    candidate?: RTCIceCandidateInit;
-                  };
-                  signalsRef.current?.enqueue(async (current) => {
-                    const valid = () =>
-                      current() &&
-                      pcRef.current === pc &&
-                      gen === sessionGenerationRef.current &&
-                      pc.signalingState !== 'closed';
-                    if (!valid()) return;
-                    if (sig?.sdp) {
-                      try {
-                        await pc.setRemoteDescription(new RTCSessionDescription(sig.sdp));
-                        if (!valid()) return;
-                        await iceQueueRef.current.flush(pc);
-                        if (!valid()) return;
-                        if (sig.sdp.type === 'offer') {
-                          const answer = await pc.createAnswer();
-                          if (!valid()) return;
-                          await pc.setLocalDescription(answer);
-                          if (!valid()) return;
-                          callbacksRef.current.sendSignal(peer.id, { sdp: pc.localDescription });
-                        }
-                      } catch (err) {
-                        networkLog('Error handling queued SDP signal:', err);
-                        if (isV2Active()) {
-                          raceRef.current?.check();
-                        } else {
-                          callbacksRef.current.fallbackToRelay();
-                        }
-                      }
-                    } else if (sig?.candidate) {
-                      await iceQueueRef.current.add(pc, sig.candidate);
-                    }
-                  });
-                }
-              }
-            }
           }
         } else if (msg.type === 'v2-path') {
           if (typeof msg.from === 'string' && msg.from === targetPeerRef.current?.id) {
@@ -2077,24 +2082,42 @@ export function usePeerDrop(wsUrl: string) {
               agreementRef.current.receive(msg);
             } else if (negotiatingPeerIdRef.current === msg.from) {
               const now = Date.now();
-              earlyPathMsgsRef.current = earlyPathMsgsRef.current.filter((e) => now - e.at <= 5_000);
+              const gen = sessionGenerationRef.current;
+              earlyPathMsgsRef.current = earlyPathMsgsRef.current.filter(
+                (e) => now - e.at <= 10_000 && e.generation === gen
+              );
               if (earlyPathMsgsRef.current.length < 16) {
-                earlyPathMsgsRef.current.push({ msg, at: now });
+                earlyPathMsgsRef.current.push({
+                  msg,
+                  peerId: msg.from,
+                  generation: gen,
+                  at: now,
+                });
               }
             }
           }
         } else if (msg.type === 'relay') {
           callbacksRef.current.handleProtocolJson(msg.payload as Record<string, unknown>);
         } else if (msg.type === 'signal') {
+          const fromId = typeof msg.from === 'string' ? msg.from : '';
+          if (!fromId) return;
           if (!targetPeerRef.current || !authenticatedSessionRef.current) {
             const now = Date.now();
-            earlySignalsRef.current = earlySignalsRef.current.filter((e) => now - e.at <= 5_000);
+            const gen = sessionGenerationRef.current;
+            earlySignalsRef.current = earlySignalsRef.current.filter(
+              (e) => now - e.at <= 10_000 && e.generation === gen
+            );
             if (earlySignalsRef.current.length < 128) {
-              earlySignalsRef.current.push({ msg, at: now });
+              earlySignalsRef.current.push({
+                msg,
+                peerId: fromId,
+                generation: gen,
+                at: now,
+              });
             }
             return;
           }
-          if (msg.from !== targetPeerRef.current.id) {
+          if (fromId !== targetPeerRef.current.id) {
             return;
           }
           const sender = targetPeerRef.current;
@@ -2102,9 +2125,17 @@ export function usePeerDrop(wsUrl: string) {
           if (!pc || pc.signalingState === 'closed') {
             if (negotiatingPeerIdRef.current === sender.id) {
               const now = Date.now();
-              earlySignalsRef.current = earlySignalsRef.current.filter((e) => now - e.at <= 5_000);
+              const gen = sessionGenerationRef.current;
+              earlySignalsRef.current = earlySignalsRef.current.filter(
+                (e) => now - e.at <= 10_000 && e.generation === gen
+              );
               if (earlySignalsRef.current.length < 128) {
-                earlySignalsRef.current.push({ msg, at: now });
+                earlySignalsRef.current.push({
+                  msg,
+                  peerId: sender.id,
+                  generation: gen,
+                  at: now,
+                });
               }
             }
             return;
@@ -2114,54 +2145,7 @@ export function usePeerDrop(wsUrl: string) {
             sdp?: RTCSessionDescriptionInit;
             candidate?: RTCIceCandidateInit;
           };
-
-          signalsRef.current?.enqueue(async (current) => {
-            const valid = () =>
-              current() &&
-              pcRef.current === pc &&
-              gen === sessionGenerationRef.current &&
-              pc.signalingState !== 'closed';
-            if (!valid()) return;
-
-            if (signal?.sdp) {
-              try {
-                const polite = myIdRef.current > sender.id;
-                if (signal.sdp.type === 'offer' && pc.signalingState === 'have-local-offer') {
-                  if (!polite) return;
-                  await pc.setLocalDescription({ type: 'rollback' });
-                  if (!valid()) return;
-                }
-                iceQueueRef.current.beginRemoteDescription();
-                try {
-                  await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-                } finally {
-                  iceQueueRef.current.endRemoteDescription();
-                }
-                if (!valid()) return;
-                await iceQueueRef.current.flush(pc);
-                if (!valid()) return;
-
-                if (signal.sdp.type === 'offer') {
-                  const answer = await pc.createAnswer();
-                  if (!valid()) return;
-                  await pc.setLocalDescription(answer);
-                  if (!valid()) return;
-                  callbacksRef.current.sendSignal(sender.id, { sdp: pc.localDescription });
-                } else if (signal.sdp.type === 'answer') {
-                  profilerRef.current?.mark('answer installed');
-                }
-              } catch (err) {
-                networkLog('Error handling remote SDP signal:', err);
-                if (isV2Active()) {
-                  raceRef.current?.check();
-                } else {
-                  callbacksRef.current.fallbackToRelay();
-                }
-              }
-            } else if (signal?.candidate) {
-              await iceQueueRef.current.add(pc, signal.candidate);
-            }
-          });
+          enqueueSignal(pc, sender.id, gen, signal);
         }
       },
     });
@@ -2286,7 +2270,7 @@ export function usePeerDrop(wsUrl: string) {
       socketManager.close();
       socketManagerRef.current = null;
     };
-  }, [wsUrl]);
+  }, [wsUrl, clearEarlyBuffers, enqueueSignal]);
 
   // Request to connect with a 4-digit PIN
   const connectWithPin = useCallback(
@@ -2379,6 +2363,7 @@ export function usePeerDrop(wsUrl: string) {
     backpressureWaiterRef.current = null;
     resilienceRef.current?.notify();
 
+    clearEarlyBuffers();
     teardownPeerConnection();
     targetPeerRef.current = null;
     setConnectedPeer(null);
@@ -2399,7 +2384,7 @@ export function usePeerDrop(wsUrl: string) {
         roomCode: pinRef.current,
       })
     );
-  }, [teardownPeerConnection]);
+  }, [clearEarlyBuffers, teardownPeerConnection]);
 
   const pushMyClipboard = useCallback(
     (text: string) => {

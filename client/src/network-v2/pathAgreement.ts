@@ -10,6 +10,7 @@ export interface PathAgreementOptions {
   busy:()=>boolean;
   onCommit:(path:CommittedPath)=>void;
   invalidate:(reason:Error)=>void;
+  onTrace?:(event:string,detail:Record<string,string|number|boolean|null>)=>void;
   signal:AbortSignal;
 }
 interface Pending {epoch:string;path:CommittedPath;stage:'prepare'|'ready'|'commit'|'committed'}
@@ -19,8 +20,21 @@ export function createPathAgreement(o:PathAgreementOptions){
   const release=()=>{clearTimeout(timer);timer=undefined;pending=undefined;};
   const close=()=>{closed=true;release();o.signal.removeEventListener('abort',close);};
   const invalidate=(e:unknown)=>{if(closed)return;close();o.invalidate(e instanceof Error?e:new Error('Transport agreement failed'));};
-  const arm=()=>{clearTimeout(timer);timer=setTimeout(()=>invalidate(new Error('Transport agreement timed out')),3000);};
-  function send(stage:Stage,p:Pick<Pending,'epoch'|'path'>){o.send({type:'v2-path',epoch:p.epoch,path:p.path,stage});}
+  const arm=()=>{clearTimeout(timer);timer=setTimeout(()=>{
+    if(closed||!pending)return;
+    const timedOut=pending;
+    if(timedOut.stage==='prepare'||timedOut.stage==='ready'){
+      o.onTrace?.('proposal-timeout',{stage:timedOut.stage,path:timedOut.path,epoch:timedOut.epoch.slice(0,8)});
+      release();
+      return;
+    }
+    o.onTrace?.('commit-timeout',{stage:timedOut.stage,path:timedOut.path,epoch:timedOut.epoch.slice(0,8)});
+    invalidate(new Error(`Transport agreement timed out at ${timedOut.stage}`));
+  },3000);};
+  function send(stage:Stage,p:Pick<Pending,'epoch'|'path'>){
+    o.onTrace?.('tx',{stage,path:p.path,epoch:p.epoch.slice(0,8)});
+    o.send({type:'v2-path',epoch:p.epoch,path:p.path,stage});
+  }
   function commit(path:CommittedPath){if(!o.available(path)||o.busy())throw new Error('Transport no longer safe to commit');current=path;o.onCommit(path);}
   o.signal.addEventListener('abort',close,{once:true});if(o.signal.aborted)close();
   return {
@@ -35,6 +49,7 @@ export function createPathAgreement(o:PathAgreementOptions){
     receive(raw:unknown){if(closed||!raw||typeof raw!=='object'||!('type'in raw)||raw.type!=='v2-path')return;
       if(!('epoch'in raw)||typeof raw.epoch!=='string'||raw.epoch.length>64||!('path'in raw)||(raw.path!=='rtc'&&raw.path!=='relay')||!('stage'in raw)||typeof raw.stage!=='string')return;
       const p={epoch:raw.epoch,path:raw.path} as Pick<Pending,'epoch'|'path'>;
+      o.onTrace?.('rx',{stage:raw.stage,path:p.path,epoch:p.epoch.slice(0,8)});
       try{
         if(!o.leader&&raw.stage==='prepare'){
           if(pending||o.busy()||!o.available(p.path)){send('reject',p);return;}
@@ -43,9 +58,11 @@ export function createPathAgreement(o:PathAgreementOptions){
         if(!pending||p.epoch!==pending.epoch||p.path!==pending.path)return;
         if(o.leader&&raw.stage==='reject'&&pending.stage==='prepare'){release();return;}
         if(o.leader&&raw.stage==='ready'&&pending.stage==='prepare'){
-          if(o.busy()||!o.available(p.path))throw new Error('Path changed during prepare');pending.stage='commit';arm();send('commit',pending);return;
+          if(o.busy()||!o.available(p.path)){release();return;}
+          pending.stage='commit';arm();send('commit',pending);return;
         }
         if(!o.leader&&raw.stage==='commit'&&pending.stage==='ready'){
+          if(o.busy()||!o.available(p.path)){send('reject',p);release();return;}
           commit(p.path);pending.stage='committed';arm();send('committed',pending);return;
         }
         if(o.leader&&raw.stage==='committed'&&pending.stage==='commit'){
@@ -54,7 +71,10 @@ export function createPathAgreement(o:PathAgreementOptions){
         if(!o.leader&&raw.stage==='activate'&&pending.stage==='committed'){release();return;}
       }catch(e){invalidate(e);}
     },
-    signalingLost(){if(pending)invalidate(new Error('Signaling lost during transport agreement'));},
+    signalingLost(){if(pending){
+      if(pending.stage==='prepare'||pending.stage==='ready'){release();return;}
+      invalidate(new Error('Signaling lost during transport agreement'));
+    }},
     close,
   };
 }

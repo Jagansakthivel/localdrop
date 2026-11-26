@@ -60,11 +60,30 @@ export function startTransportRace(o:RaceOptions){
   if(o.signal.aborted)stop();else check();
   return {check,stop};
 }
-export async function fetchIceServersWithExpiry(wsUrl:string,token:string,roomCode:string,signal:AbortSignal):Promise<{iceServers:RTCIceServer[];expiresAt:number|null}>{
+export type TurnFetchStatus =
+  | 'turn-issued'
+  | 'turn-not-configured'
+  | 'turn-auth-failed'
+  | 'turn-quota-or-forbidden'
+  | 'turn-timeout'
+  | 'turn-invalid-response';
+export async function fetchIceServersWithExpiry(wsUrl:string,token:string,roomCode:string,signal:AbortSignal):Promise<{iceServers:RTCIceServer[];expiresAt:number|null;status:TurnFetchStatus}>{
   checkAbort(signal);const u=new URL(wsUrl,location.href);u.protocol=u.protocol==='wss:'?'https:':'http:';u.pathname='/api/ice-servers';u.search='';u.hash='';
-  const scope=abortScope([signal],1500);
-  try{const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},body:JSON.stringify({roomCode}),signal:scope.signal,cache:'no-store'});if(!r.ok)return {iceServers:STUN,expiresAt:null};const body:unknown=await r.json();const parsed=parseTurnResponse(body);return {iceServers:[...STUN,...parsed.iceServers],expiresAt:parsed.expiresAt};
-  }catch{checkAbort(signal);return {iceServers:STUN,expiresAt:null};}
+  const scope=abortScope([signal],2500);
+  try{
+    const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},body:JSON.stringify({roomCode}),signal:scope.signal,cache:'no-store'});
+    if(!r.ok){
+      const status:TurnFetchStatus=r.status===401?'turn-auth-failed':r.status===403?'turn-quota-or-forbidden':'turn-invalid-response';
+      return {iceServers:STUN,expiresAt:null,status};
+    }
+    const body:unknown=await r.json();
+    const parsed=parseTurnResponse(body);
+    const status:TurnFetchStatus=parsed.iceServers.length>0?'turn-issued':'turn-not-configured';
+    return {iceServers:[...STUN,...parsed.iceServers],expiresAt:parsed.expiresAt,status};
+  }catch{
+    checkAbort(signal);
+    return {iceServers:STUN,expiresAt:null,status:scope.signal.aborted?'turn-timeout':'turn-invalid-response'};
+  }
   finally{scope.dispose();}
 }
 export async function fetchIceServers(wsUrl:string,token:string,roomCode:string,signal:AbortSignal):Promise<RTCIceServer[]>{

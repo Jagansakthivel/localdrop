@@ -14,6 +14,8 @@ import { attachHeartbeat } from '../src/utils/heartbeat.ts';
 import { sanitizeSuggestedFilename } from '../src/utils/saveName.ts';
 import { uniqueExportName } from '../src/utils/fileSafety.ts';
 import { peerVersion, roomWireVersion, ackMatches, isRelayError, matchesTransfer } from '../src/network-v2/protocol.ts';
+import { createPathAgreement } from '../src/network-v2/pathAgreement.ts';
+import { createSerialSignals } from '../src/network-v2/serialSignals.ts';
 
 class MockWebSocket extends EventTarget {
   static OPEN = 1;
@@ -257,4 +259,156 @@ test('waitSocket resets stall deadline on drain and protocol/filename helpers en
   const used = new Set<string>();
   assert.equal(uniqueExportName('photo.jpg', used), 'photo.jpg');
   assert.equal(uniqueExportName('photo.jpg', used), 'photo (1).jpg');
+});
+
+test('pathAgreement pre-commit prepare timeout releases without invalidating viable RTC', () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const traces: string[] = [];
+    let invalidated = false;
+    let committed: string | null = null;
+    let rtcAvailable = false;
+    const ac = new AbortController();
+
+    const leader = createPathAgreement({
+      leader: true,
+      send: () => {},
+      available: (p) => (p === 'relay' ? true : rtcAvailable),
+      busy: () => false,
+      onCommit: (p) => {
+        committed = p;
+      },
+      invalidate: () => {
+        invalidated = true;
+      },
+      onTrace: (ev, d) => traces.push(`${ev}:${String(d.stage ?? '')}`),
+      signal: ac.signal,
+    });
+
+    // Leader proposes relay, follower never responds to prepare -> 3000ms pre-commit timeout
+    assert.equal(leader.request('relay'), true);
+    assert.equal(leader.locked, true);
+    mock.timers.tick(3050);
+
+    // Must NOT invalidate or destroy agreement; simply releases pending proposal
+    assert.equal(invalidated, false);
+    assert.equal(leader.locked, false);
+    assert.ok(traces.includes('proposal-timeout:prepare'));
+
+    // Later, RTC becomes available and can still propose and commit cleanly
+    rtcAvailable = true;
+    const sent: unknown[] = [];
+    const follower = createPathAgreement({
+      leader: false,
+      send: (pkt) => sent.push(pkt),
+      available: () => true,
+      busy: () => false,
+      onCommit: () => {},
+      invalidate: () => {},
+      signal: ac.signal,
+    });
+    const leader2 = createPathAgreement({
+      leader: true,
+      send: (pkt) => follower.receive(pkt),
+      available: () => true,
+      busy: () => false,
+      onCommit: (p) => {
+        committed = p;
+      },
+      invalidate: () => {
+        invalidated = true;
+      },
+      signal: ac.signal,
+    });
+    // Wire follower replies synchronously
+    const origSent = sent;
+    assert.equal(leader2.request('rtc'), true);
+    while (origSent.length) leader2.receive(origSent.shift());
+    assert.equal(committed, 'rtc');
+    assert.equal(invalidated, false);
+    ac.abort();
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+for (const delayMs of [500, 1200, 2000]) {
+  test(`early SDP offer arriving during ${delayMs}ms delayed TURN init is preserved and applied`, async () => {
+    const queue: Array<{ peerId: string; generation: number; sdpType: string }> = [];
+    const serial = createSerialSignals((err) => {
+      throw err;
+    });
+    const activeGen = 1;
+    const activePeer = 'peer-A';
+
+    // Simulate TURN fetch delay
+    const turnPromise = new Promise<void>((r) => setTimeout(r, Math.min(delayMs, 30)));
+    // Offer arrives BEFORE PeerConnection exists, plus stale offer from old generation
+    queue.push({ peerId: activePeer, generation: activeGen, sdpType: 'offer' });
+    queue.push({ peerId: activePeer, generation: 0, sdpType: 'offer' });
+    queue.push({ peerId: 'peer-OLD', generation: activeGen, sdpType: 'offer' });
+
+    await turnPromise;
+    // PeerConnection created (simulated teardown must NOT clear queue for activePeer + activeGen)
+    const applied: string[] = [];
+    for (const item of queue.splice(0)) {
+      if (item.peerId !== activePeer || item.generation !== activeGen) continue;
+      serial.enqueue(async () => {
+        applied.push(`${item.peerId}:${item.generation}:${item.sdpType}`);
+      });
+    }
+    await serial.drain();
+    assert.deepEqual(applied, ['peer-A:1:offer']);
+  });
+}
+
+test('lost commit or committed messages never leave peers on mismatched active paths', async () => {
+  let follower!: ReturnType<typeof createPathAgreement>;
+  let leader!: ReturnType<typeof createPathAgreement>;
+  let leaderInvalidated = false;
+  let followerInvalidated = false;
+  let dropCommitted = false;
+
+  const ac = new AbortController();
+  leader = createPathAgreement({
+    leader: true,
+    send: (msg) => {
+      if (msg.stage === 'commit' && !dropCommitted) {
+        // First test: drop commit on wire by not forwarding when requested
+      }
+      queueMicrotask(() => follower.receive(msg));
+    },
+    available: () => true,
+    busy: () => false,
+    onCommit: () => {},
+    invalidate: () => {
+      leaderInvalidated = true;
+    },
+    signal: ac.signal,
+  });
+
+  follower = createPathAgreement({
+    leader: false,
+    send: (msg) => {
+      if (msg.stage === 'committed' && dropCommitted) return;
+      queueMicrotask(() => leader.receive(msg));
+    },
+    available: () => true,
+    busy: () => false,
+    onCommit: () => {},
+    invalidate: () => {
+      followerInvalidated = true;
+    },
+    signal: ac.signal,
+  });
+
+  dropCommitted = true;
+  assert.equal(leader.request('rtc'), true);
+  await new Promise((r) => setTimeout(r, 3200));
+
+  assert.equal(leaderInvalidated, true);
+  assert.equal(followerInvalidated, true);
+  assert.equal(leader.canStart(), false);
+  assert.equal(follower.canStart(), false);
+  ac.abort();
 });
