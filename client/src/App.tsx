@@ -63,6 +63,8 @@ export default function App() {
   const batchAbortRef = useRef<AbortController | null>(null);
   const connectedPeerRef = useRef(connectedPeer);
   connectedPeerRef.current = connectedPeer;
+  const lastErrorRef = useRef(lastError);
+  lastErrorRef.current = lastError;
   const [channelSessionId, setChannelSessionId] = useState<string | null>(null);
   const lastPeerIdRef = useRef<string | null>(null);
   const autoPairAttemptedRef = useRef<string | null>(null);
@@ -141,7 +143,7 @@ export default function App() {
         send: async (item) => {
           const ok = await sendFile(item.file);
           if (!ok) {
-            toast.error(`Transfer cancelled or declined: ${item.name}`);
+            toast.error(lastErrorRef.current || `Transfer failed: ${item.name}`);
           }
           return ok;
         },

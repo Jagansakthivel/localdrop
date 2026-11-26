@@ -12,9 +12,18 @@ export class IceCandidateQueue {
 
   async add(pc: RTCPeerConnection, candidate: RTCIceCandidateInit): Promise<void> {
     if (pc.signalingState === 'closed') return;
+    if (
+      candidate.candidate === '' &&
+      candidate.sdpMid == null &&
+      candidate.sdpMLineIndex == null
+    ) {
+      return;
+    }
 
     if (!pc.remoteDescription || this.settingRemote) {
-      this.candidates.push(candidate);
+      if (this.candidates.length < 256) {
+        this.candidates.push(candidate);
+      }
       return;
     }
 
