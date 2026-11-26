@@ -216,10 +216,13 @@ export default function App() {
         size: formatBytes(telemetry.totalBytes),
         progress: telemetry.progress,
         direction: telemetry.direction === 'sending' ? 'send' : 'receive',
-        transferState: telemetry.progress >= 100 ? 'complete' : 'active',
+        transferState: matchingFile ? 'complete' : 'active',
+        awaitingApproval: telemetry.awaitingApproval,
         status:
           telemetry.progress >= 100
-            ? 'Verified ✓'
+            ? matchingFile
+              ? 'Verified ✓'
+              : 'Finalizing…'
             : `${(telemetry.speedMbps).toFixed(1)} MB/s · ${telemetry.etaSeconds}s remaining`,
         file: matchingFile || null,
       });

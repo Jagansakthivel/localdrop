@@ -1,446 +1,138 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import { formatFilename } from '../utils/formatFilename';
+import { canAnimatePackets, clampProgress, motionPhase, phaseLabel, type TransferDirection, type TransferStatus } from '../utils/motionPhase';
 import '../motion.css';
+import './motion-finale.css';
 
-const spring = { type: 'spring', stiffness: 240, damping: 24, mass: 0.85 } as const;
+const soft = { type: 'spring', stiffness: 270, damping: 25, mass: .85 } as const;
+const snap = { type: 'spring', stiffness: 420, damping: 31, mass: .72 } as const;
+const instant = { duration: 0 } as const;
+const ease = [0.22, 1, 0.36, 1] as const;
+export type MotionTransfer = { id: string; name: string; direction: TransferDirection; progress: number; status: TransferStatus; speedLabel?: string; awaitingApproval?: boolean; paused?: boolean };
+export type StagedFile = { id: string; name: string; sizeLabel: string; previewUrl?: string };
 
-export type MotionTransfer = {
-  id: string;
-  name: string;
-  direction: 'send' | 'receive';
-  progress: number;
-  status: 'active' | 'complete' | 'failed' | 'cancelled';
-  speedLabel?: string;
-};
-
-export type StagedFile = {
-  id: string;
-  name: string;
-  sizeLabel: string;
-  previewUrl?: string;
-};
-
-function Device({ phone = false }: { phone?: boolean }) {
-  return (
-    <svg viewBox="0 0 100 100" fill="none" aria-hidden="true">
-      {phone ? (
-        <>
-          <rect x="31" y="12" width="38" height="76" rx="9" fill="currentColor" />
-          <rect x="35" y="17" width="30" height="65" rx="6" fill="var(--ld-paper)" />
-          <path d="M44 21h12" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
-        </>
-      ) : (
-        <>
-          <rect x="13" y="21" width="74" height="51" rx="5" fill="currentColor" />
-          <rect x="17" y="25" width="66" height="43" rx="2" fill="var(--ld-paper)" />
-          <path d="M8 77h84l-6 7H14z" fill="currentColor" />
-        </>
-      )}
-    </svg>
-  );
+function usePageVisible() {
+  const [visible, setVisible] = useState(() => typeof document !== 'undefined' && !document.hidden);
+  useEffect(() => { const update = () => setVisible(!document.hidden); document.addEventListener('visibilitychange', update); update(); return () => document.removeEventListener('visibilitychange', update); }, []);
+  return visible;
 }
-
-// Mount persistently. Trigger only on the actual data-channel open event.
-export function Handshake({
-  connectionId,
-  peerName,
-  peerIsPhone = false,
-}: {
-  connectionId: string | null;
-  peerName: string;
-  peerIsPhone?: boolean;
-}) {
-  const reduced = useReducedMotion();
-  const [visible, setVisible] = useState(false);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-
+// Decorative activity only: a stall never modifies transfer state or network timeouts.
+function useAdvancing(id: string, progress: number, enabled: boolean) {
+  const previous = useRef<{ id: string; progress: number } | null>(null);
+  const [advancing, setAdvancing] = useState(false);
   useEffect(() => {
-    if (!connectionId) {
-      setVisible(false);
-      return;
-    }
-    previousFocusRef.current = document.activeElement as HTMLElement | null;
-    setVisible(true);
-    const timer = setTimeout(() => setVisible(false), reduced ? 1200 : 2100);
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setVisible(false);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      clearTimeout(timer);
-      window.removeEventListener('keydown', onKeyDown);
-      previousFocusRef.current?.focus?.();
-    };
-  }, [connectionId, reduced]);
-
-  return (
-    <AnimatePresence>
-      {visible && connectionId && (
-        <motion.div
-          key={connectionId}
-          className="ld-handshake"
-          role="status"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-        >
-          <motion.div
-            className="ld-handshake-sheet ldv-connection-modal"
-            initial={reduced ? false : { y: 24, scale: 0.94 }}
-            animate={{ y: 0, scale: 1 }}
-            transition={spring}
-          >
-            <div className="ld-kicker">LOCALDROP / CONNECTION</div>
-            <div className="ld-handshake-stage">
-              <motion.div
-                className="ld-device"
-                initial={reduced ? false : { x: -42, rotate: -13 }}
-                animate={{ x: 0, rotate: -5 }}
-                transition={spring}
-              >
-                <Device />
-              </motion.div>
-              <svg className="ld-bridge" viewBox="0 0 120 60" aria-hidden="true">
-                <motion.path
-                  d="M2 30 C35 30 35 8 60 30 S85 30 118 30"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  initial={{ pathLength: reduced ? 1 : 0 }}
-                  animate={{ pathLength: 1 }}
-                  transition={{ duration: 0.55, delay: reduced ? 0 : 0.25 }}
-                />
-                <motion.circle
-                  cx="60"
-                  cy="30"
-                  r="8"
-                  fill="currentColor"
-                  initial={{ scale: reduced ? 1 : 0 }}
-                  animate={{ scale: 1 }}
-                  transition={{ ...spring, delay: reduced ? 0 : 0.65 }}
-                />
-                {!reduced && (
-                  <motion.circle
-                    cx="60"
-                    cy="30"
-                    r="12"
-                    fill="none"
-                    stroke="currentColor"
-                    initial={{ scale: 0.5, opacity: 0 }}
-                    animate={{ scale: [0.5, 1, 3], opacity: [0, 1, 0] }}
-                    transition={{ delay: 0.65, duration: 0.85 }}
-                  />
-                )}
-              </svg>
-              <motion.div
-                className="ld-device ld-peer"
-                initial={reduced ? false : { x: 42, rotate: 13 }}
-                animate={{ x: 0, rotate: 5 }}
-                transition={spring}
-              >
-                <Device phone={peerIsPhone} />
-              </motion.div>
-            </div>
-            <motion.div
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: reduced ? 0 : 0.55 }}
-            >
-              <h2>You're connected.</h2>
-              <p>{peerName || 'Peer'}</p>
-            </motion.div>
-            <button
-              type="button"
-              className="ld-dismiss"
-              onClick={() => setVisible(false)}
-              aria-label="Dismiss connection confirmation"
-            >
-              ×
-            </button>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
-  );
+    if (!enabled) { previous.current = null; setAdvancing(false); return; }
+    const prev = previous.current;
+    previous.current = { id, progress };
+    if (prev?.id === id && progress <= prev.progress) { setAdvancing(false); return; }
+    setAdvancing(progress > 0);
+    const timer = window.setTimeout(() => setAdvancing(false), 2200);
+    return () => window.clearTimeout(timer);
+  }, [id, progress, enabled]);
+  return advancing && enabled;
 }
 
-export function FileStack({
-  files,
-  onRemove,
-}: {
-  files: StagedFile[];
-  onRemove: (id: string) => void;
-}) {
+// Custom device artwork. The file on the destination screen fills from real progress.
+function Device({ phone = false, destination = false, progress = 0, connected = false }: { phone?: boolean; destination?: boolean; progress?: number; connected?: boolean }) {
   const reduced = useReducedMotion();
-  const [expanded, setExpanded] = useState(false);
-  const id = useId();
-
-  const validFiles = Array.isArray(files) ? files.filter((f) => f && typeof f === 'object' && f.id) : [];
-
-  if (validFiles.length === 0) return null;
-
-  return (
-    <AnimatePresence>
-      <motion.section
-        className="ld-stack"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-      >
-        <div className="ld-stack-top">
-          <div className="ld-paper-stage" aria-hidden="true">
-            <AnimatePresence>
-              {validFiles.slice(-4).map((f, i, a) => {
-                const depth = a.length - 1 - i;
-                const ext = (f.name || 'file').split('.').pop()?.slice(0, 5).toUpperCase() || 'FILE';
-
-                return (
-                  <motion.div
-                    key={f.id}
-                    className="ld-paper"
-                    initial={
-                      reduced
-                        ? false
-                        : { y: -65, x: 35, rotate: 18, scale: 0.7, opacity: 0 }
-                    }
-                    animate={{
-                      y: -depth * 8,
-                      x: depth * 12,
-                      rotate: depth * 7 - 5,
-                      scale: 1 - depth * 0.045,
-                      opacity: 1,
-                    }}
-                    exit={{ opacity: 0 }}
-                    transition={spring}
-                  >
-                    {f.previewUrl ? (
-                      <img
-                        src={f.previewUrl}
-                        alt=""
-                        onError={(e) => {
-                          // Fallback to extension view if image fails
-                          (e.target as HTMLElement).style.display = 'none';
-                        }}
-                      />
-                    ) : (
-                      <>
-                        <span className="ld-extension">{ext}</span>
-                        <i />
-                        <i />
-                        <i />
-                      </>
-                    )}
-                  </motion.div>
-                );
-              })}
-            </AnimatePresence>
-          </div>
-          <div>
-            <div className="ld-kicker">READY TO SEND</div>
-            <h3>
-              <span className="ld-number">{validFiles.length}</span>{' '}
-              {validFiles.length === 1 ? 'file' : 'files'}
-            </h3>
-            <button
-              type="button"
-              className="ld-text-button"
-              aria-expanded={expanded}
-              aria-controls={id}
-              onClick={() => setExpanded((v) => !v)}
-            >
-              {expanded ? 'Hide files' : 'Review files'} ↗
-            </button>
-          </div>
-        </div>
-
-        <AnimatePresence initial={false}>
-          {expanded && (
-            <motion.div
-              id={id}
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={reduced ? { duration: 0 } : spring}
-              className="ld-file-list"
-            >
-              {validFiles.map((f) => (
-                <div key={f.id} className="ld-file-row">
-                  <span title={f.name}>{formatFilename(f.name || 'Unnamed file', 36)}</span>
-                  <small>{f.sizeLabel}</small>
-                  <button type="button" onClick={() => onRemove(f.id)} aria-label={`Remove ${f.name}`}>
-                    ×
-                  </button>
-                </div>
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.section>
-    </AnimatePresence>
-  );
+  const clip = useId();
+  return <svg viewBox="0 0 100 100" fill="none" aria-hidden="true">
+    <defs><clipPath id={clip}><rect x="40" y="37" width="20" height="25" rx="3" /></clipPath></defs>
+    {phone ? <><rect x="28" y="10" width="44" height="80" rx="10" fill="currentColor"/><rect x="32" y="14" width="36" height="72" rx="7" fill="var(--ld-paper,var(--surface))"/><path d="M45 19h10m-10 62h10" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/></> : <><rect x="11" y="20" width="78" height="55" rx="6" fill="currentColor"/><rect x="15" y="24" width="70" height="47" rx="3" fill="var(--ld-paper,var(--surface))"/><path d="M6 79h88l-7 6H13z" fill="currentColor"/><path d="M42 80h16" stroke="var(--ld-paper,var(--surface))" strokeWidth="2" strokeLinecap="round"/></>}
+    {connected ? <motion.path d="m42 48 6 6 11-13" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" initial={reduced ? false : { pathLength:0, opacity:0 }} animate={{ pathLength:1, opacity:1 }} transition={reduced ? instant : {duration:.32,delay:.58}}/> : <>
+      <rect x="40" y="37" width="20" height="25" rx="3" stroke="currentColor" strokeWidth="1.5" opacity={destination ? .65 : 1}/>
+      <g clipPath={`url(#${clip})`}><motion.rect x="40" y="37" width="20" height="25" fill="currentColor" opacity=".23" style={{transformOrigin:'50px 62px'}} initial={false} animate={{scaleY:destination ? clampProgress(progress)/100 : 1}} transition={reduced ? instant : {duration:.16,ease:'linear'}}/></g>
+      <path d="M44 44h12m-12 5h8m-8 5h10" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" opacity=".65"/>
+    </>}
+  </svg>;
 }
 
-export function TransferMotion({
-  transfer: t,
-  children,
-}: {
-  transfer: MotionTransfer;
-  children?: React.ReactNode;
-}) {
-  const reduced = useReducedMotion();
-  const rawClip = useId();
-  const clip = `clip-${rawClip.replace(/:/g, '')}`;
-
-  if (!t || typeof t !== 'object') return null;
-
-  const p = Math.min(100, Math.max(0, typeof t.progress === 'number' && Number.isFinite(t.progress) ? t.progress : 0));
-  const sending = t.direction === 'send';
-  const active = t.status === 'active';
-  const done = t.status === 'complete';
-  const displayName = formatFilename(t.name || 'File', 44);
-
-  return (
-    <motion.article
-      className={`ld-transfer ld-transfer-card ${sending ? 'ld-out' : 'ld-in'}`}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-    >
-      <div className="ld-transfer-art ld-transfer-animation" aria-hidden="true">
-        <svg viewBox="0 0 320 120">
-          <defs>
-            <clipPath id={clip}>
-              <rect x="235" y="25" width="54" height="70" rx="7" />
-            </clipPath>
-          </defs>
-          <g transform={sending ? '' : 'translate(320 0) scale(-1 1)'}>
-            <rect
-              x="30"
-              y="25"
-              width="54"
-              height="70"
-              rx="7"
-              fill="var(--ld-paper)"
-              stroke="currentColor"
-              strokeWidth="1.5"
-            />
-            <path
-              d="M42 43h29M42 53h22M42 63h26"
-              stroke="currentColor"
-              opacity=".45"
-              strokeWidth="2"
-              strokeLinecap="round"
-            />
-            <path
-              d="M91 60H228"
-              stroke="currentColor"
-              opacity=".25"
-              strokeDasharray="3 6"
-            />
-            <rect
-              x="235"
-              y="25"
-              width="54"
-              height="70"
-              rx="7"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeDasharray={done ? undefined : '4 4'}
-            />
-            <g clipPath={`url(#${clip})`}>
-              <motion.rect
-                x="235"
-                width="54"
-                y={95 - (70 * (done ? 100 : p)) / 100}
-                height={(70 * (done ? 100 : p)) / 100}
-                fill="currentColor"
-                opacity=".23"
-                initial={false}
-                animate={{
-                  y: 95 - (70 * (done ? 100 : p)) / 100,
-                  height: (70 * (done ? 100 : p)) / 100,
-                }}
-                transition={reduced ? { duration: 0 } : { duration: 0.25 }}
-              />
-            </g>
-            {active &&
-              !reduced &&
-              Array.from({ length: 5 }, (_, i) => (
-                <motion.rect
-                  key={i}
-                  x="92"
-                  y={47 + (i % 3) * 12}
-                  width={8 + (i % 2) * 5}
-                  height="5"
-                  rx="2"
-                  fill="currentColor"
-                  initial={{ x: 0, opacity: 0 }}
-                  animate={{ x: [0, 128], opacity: [0, 1, 1, 0] }}
-                  transition={{
-                    duration: 1.15,
-                    delay: i * 0.18,
-                    repeat: Infinity,
-                    ease: 'linear',
-                  }}
-                />
-              ))}
-            {done && (
-              <motion.path
-                d="M247 60l10 10 20-23"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="3"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                initial={{ pathLength: reduced ? 1 : 0 }}
-                animate={{ pathLength: 1 }}
-                transition={{ duration: 0.35 }}
-              />
-            )}
-          </g>
+// 1. Magnetic handshake: finite sequence, no focus trap or full-screen blur.
+// connectionId must identify an established logical session, not a socket/ICE generation.
+export function Handshake({ connectionId, peerName, peerIsPhone = false, localIsPhone = false, ready = true }: { connectionId: string | null; peerName: string; peerIsPhone?: boolean; localIsPhone?: boolean; ready?: boolean }) {
+  const reduced = Boolean(useReducedMotion());
+  const visible = usePageVisible();
+  const seen = useRef<string | null>(null);
+  const [shown, setShown] = useState<string | null>(null);
+  useEffect(() => {
+    if (!connectionId) { seen.current = null; setShown(null); return; }
+    if (ready && visible && seen.current !== connectionId) { seen.current = connectionId; setShown(connectionId); }
+    if (!visible || !ready) setShown(null);
+  }, [connectionId, ready, visible]);
+  useEffect(() => {
+    if (!shown) return;
+    const timer = window.setTimeout(() => setShown(null), reduced ? 1500 : 2350);
+    return () => window.clearTimeout(timer);
+  }, [shown, reduced]);
+  return <AnimatePresence>{shown && shown === connectionId && ready && visible && <motion.div key={shown} className="ld-handshake ldf-handshake" initial={reduced ? false : {opacity:0}} animate={{opacity:1}} exit={{opacity:0}} transition={reduced ? instant : {duration:.18}}>
+    <motion.div className="ld-handshake-sheet ldv-connection-modal" initial={reduced ? false : {y:18,scale:.94,opacity:0}} animate={{y:0,scale:1,opacity:1}} exit={reduced ? {opacity:0} : {y:8,scale:.98,opacity:0}} transition={reduced ? instant : soft}>
+      <div className="ld-kicker">Connection established</div>
+      <div className="ld-handshake-stage" aria-hidden="true">
+        <motion.div className="ld-device" initial={reduced ? false : {x:-24,rotate:-14,scale:.88}} animate={{x:0,rotate:-5,scale:1}} transition={reduced ? instant : soft}><Device phone={localIsPhone} connected/></motion.div>
+        <svg className="ld-bridge" viewBox="0 0 120 64" fill="none">
+          <motion.path d="M3 32C25 32 40 16 60 32S95 32 117 32" stroke="currentColor" strokeWidth="2" strokeLinecap="round" initial={reduced ? false : {pathLength:0,opacity:0}} animate={{pathLength:1,opacity:1}} transition={reduced ? instant : {duration:.5,delay:.12,ease}}/>
+          {!reduced && [0,1].map(i=><motion.circle key={i} cx="60" cy="32" r="11" stroke="currentColor" strokeWidth="1.2" style={{transformOrigin:'60px 32px'}} initial={{scale:.65,opacity:0}} animate={{scale:[.65,1,2.5],opacity:[0,.7,0]}} transition={{duration:.78,delay:.5+i*.15,ease:'easeOut'}}/>)}
+          <motion.g style={{transformOrigin:'60px 32px'}} initial={reduced ? false : {scale:0}} animate={{scale:1}} transition={reduced ? instant : {...snap,delay:.42}}><circle cx="60" cy="32" r="11" fill="currentColor"/><path d="m55 32 3 3 7-7" stroke="var(--ld-paper,var(--surface))" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></motion.g>
         </svg>
+        <motion.div className="ld-device ldf-peer-device" initial={reduced ? false : {x:24,rotate:14,scale:.88}} animate={{x:0,rotate:5,scale:1}} transition={reduced ? instant : soft}><Device phone={peerIsPhone} connected/></motion.div>
       </div>
-      <div className="ld-transfer-copy ld-transfer-content ld-transfer-info">
-        <div className="ld-kicker ld-transfer-status">
-          {done
-            ? sending
-              ? 'SENT'
-              : 'RECEIVED'
-            : active
-              ? sending
-                ? 'SENDING'
-                : 'RECEIVING'
-              : (t.status || 'READY').toUpperCase()}
-        </div>
-        <h3
-          className="ld-transfer-name ld-transfer-filename"
-          title={t.name}
-          aria-label={t.name}
-        >
-          {displayName}
-        </h3>
-        <div
-          className="ld-progress ld-progress-track"
-          role="progressbar"
-          aria-label={`Transfer progress for ${t.name}`}
-          aria-valuenow={Math.round(p)}
-          aria-valuemin={0}
-          aria-valuemax={100}
-        >
-          <motion.div
-            className="ld-progress-fill"
-            initial={false}
-            animate={{ scaleX: p / 100 }}
-            transition={reduced ? { duration: 0 } : { duration: 0.2 }}
-          />
-        </div>
-        <div className="ld-metrics ld-transfer-meta">
-          <span className="ld-number">{Math.round(p)}%</span>
-          <span>{active ? t.speedLabel : undefined}</span>
-        </div>
-        {children}
-      </div>
-    </motion.article>
-  );
+      <div role="status"><h2>You're connected.</h2><p>{peerName}</p></div>
+      <button type="button" className="ld-dismiss" onClick={()=>setShown(null)} aria-label="Dismiss connection confirmation">×</button>
+    </motion.div>
+  </motion.div>}</AnimatePresence>;
+}
+
+// 2. Elastic stack: same existing layout, at most four illustrated files.
+function PaperPreview({ file }: {file: StagedFile}) {
+  const [failed, setFailed] = useState(false);
+  const ext = file.name.includes('.') ? file.name.split('.').pop()?.slice(0,5).toUpperCase() : 'FILE';
+  return <>{file.previewUrl && !failed ? <img src={file.previewUrl} alt="" onError={()=>setFailed(true)}/> : <><span className="ld-extension">{ext || 'FILE'}</span><i/><i/><i/></>}</>;
+}
+export function FileStack({files,onRemove}:{files:StagedFile[];onRemove:(id:string)=>void}) {
+  const reduced = Boolean(useReducedMotion());
+  const [expanded,setExpanded] = useState(false);
+  const id = useId();
+  const valid = Array.isArray(files) ? files.filter(f=>f && f.id) : [];
+  if (!valid.length) return null;
+  return <motion.section className="ld-stack" initial={reduced ? false : {opacity:0,y:6}} animate={{opacity:1,y:0}} transition={reduced ? instant : soft}>
+    <div className="ld-stack-top"><div className="ld-paper-stage" aria-hidden="true"><AnimatePresence initial={false}>{valid.slice(-4).map((f,i,a)=>{const depth=a.length-1-i;return <motion.div key={f.id} className="ld-paper" initial={reduced ? false : {x:28,y:-25,rotate:23,scale:.78,opacity:0}} animate={{x:depth*10,y:-depth*7,rotate:depth*7-5,scale:1-depth*.04,opacity:1}} exit={reduced ? {opacity:0} : {x:-12,y:8,rotate:-13,scale:.86,opacity:0}} transition={reduced ? instant : {...soft,delay:Math.min(depth*.025,.075)}}><PaperPreview key={f.previewUrl || f.id} file={f}/></motion.div>})}</AnimatePresence></div>
+      <div><div className="ld-kicker">Ready to send</div><h3><span className="ld-number">{valid.length}</span> {valid.length===1?'file':'files'}</h3><button type="button" className="ld-text-button" aria-expanded={expanded} aria-controls={id} onClick={()=>setExpanded(v=>!v)}>{expanded?'Hide files':'Review files'} ↗</button></div></div>
+    <AnimatePresence initial={false}>{expanded && <motion.div id={id} className="ld-file-list" initial={reduced?false:{height:0,opacity:0}} animate={{height:'auto',opacity:1}} exit={{height:0,opacity:0}} transition={reduced?instant:{duration:.22,ease}}>{valid.map(f=><div key={f.id} className="ld-file-row"><span title={f.name}>{formatFilename(f.name,36)}</span><small>{f.sizeLabel}</small><button type="button" onClick={()=>onRemove(f.id)} aria-label={`Remove ${f.name}`}>×</button></div>)}</motion.div>}</AnimatePresence>
+  </motion.section>;
+}
+
+// 3/4. Packet departure and assembly. Device positions stay fixed: local left, peer right.
+// Packet paths are symbolic, not one visual object per real network packet.
+function TransferScene({direction,progress,running,localIsPhone,peerIsPhone,complete}:{direction:TransferDirection;progress:number;running:boolean;localIsPhone:boolean;peerIsPhone:boolean;complete:boolean}) {
+  const reduced = Boolean(useReducedMotion());
+  const send = direction === 'send';
+  return <div className="ldf-scene" data-direction={direction} aria-hidden="true">
+    <div className="ldf-scene-device"><Device phone={localIsPhone} destination={!send} progress={progress} connected={complete&&!send}/><small>This device</small></div>
+    <svg className="ldf-flight" viewBox="0 0 144 86" fill="none" aria-hidden="true">
+      {[0,1,2].map(i=><path key={i} d={`M4 ${35+i*8} C40 ${10+i*15} 100 ${64-i*8} 140 ${35+i*8}`} stroke="currentColor" strokeWidth="1" opacity=".19" strokeLinecap="round"/>)}
+      <path d="M4 43H140" stroke="currentColor" strokeDasharray="2 5" opacity=".4"/>
+      <motion.path d={send?'M65 37l7 6-7 6m7-6H56':'M79 37l-7 6 7 6m-7-6h16'} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" initial={false} animate={{opacity:running ? .55 : 1}}/>
+      {running && !reduced && [0,1,2].map(i=><motion.g key={i} initial={{x:send?4:140,y:43,opacity:0}} animate={{x:send?[4,38,74,110,140]:[140,110,74,38,4],y:[43,28+i*6,43,55-i*6,43],opacity:[0,1,1,1,0],scale:[.7,1,1,.85,.55]}} transition={{duration:1.65,delay:i*.39,repeat:Infinity,repeatDelay:.12,ease:'linear',times:[0,.25,.5,.75,1]}}><rect x="-5" y="-7" width="10" height="14" rx="2" fill="currentColor"/><path d="M-2-2h4m-4 4h3" stroke="var(--ld-paper,var(--surface))" strokeWidth="1" strokeLinecap="round"/></motion.g>)}
+    </svg>
+    <div className="ldf-scene-device"><Device phone={peerIsPhone} destination={send} progress={progress} connected={complete&&send}/><small>Peer device</small></div>
+  </div>;
+}
+export function TransferMotion({transfer:t,children,localIsPhone=false,peerIsPhone=false,animatePackets=true,onCancel}:{transfer:MotionTransfer;children?:ReactNode;localIsPhone?:boolean;peerIsPhone?:boolean;animatePackets?:boolean;onCancel?:()=>void}) {
+  const reduced=Boolean(useReducedMotion());
+  const visible=usePageVisible();
+  const p=clampProgress(t.progress);
+  const phase=motionPhase(t.status,t.direction,p,t.awaitingApproval,t.paused);
+  const active=t.status==='active';
+  const advancing=useAdvancing(t.id,p,active && visible && animatePackets && (phase==='sending'||phase==='receiving'));
+  const running=canAnimatePackets(phase,visible,reduced,advancing)&&animatePackets;
+  const label=phase==='complete'?(t.direction==='send'?'Sent':'Received'):phaseLabel[phase];
+  return <motion.article className={`ld-transfer ld-transfer-card ldf-transfer ${t.direction==='send'?'ld-out':'ld-in'}`} initial={reduced?false:{opacity:0,y:5}} animate={{opacity:1,y:0}} transition={reduced?instant:{duration:.2,ease}}>
+    <div className="ld-transfer-art ld-transfer-animation"><TransferScene direction={t.direction} progress={p} running={running} localIsPhone={localIsPhone} peerIsPhone={peerIsPhone} complete={phase==='complete'}/></div>
+    <div className="ld-transfer-copy ld-transfer-content ld-transfer-info"><div className="ld-kicker ld-transfer-status">{label}</div><h3 className="ld-transfer-name ld-transfer-filename" title={t.name} aria-label={t.name}>{formatFilename(t.name,44)}</h3>
+      {active && <><div className="ld-progress ld-progress-track" role="progressbar" aria-label={`Transfer progress for ${t.name}`} aria-valuenow={Math.round(p)} aria-valuemin={0} aria-valuemax={100}><motion.div className="ld-progress-fill" initial={false} animate={{scaleX:p/100}} transition={reduced?instant:{duration:.16,ease:'linear'}}/></div><div className="ld-metrics ld-transfer-meta"><span className="ld-number">{Math.floor(p)}%</span><span>{phase==='sending'||phase==='receiving'?t.speedLabel:undefined}</span></div></>}
+      {children}{active && onCancel && <button className="ld-quiet ldf-cancel" type="button" onClick={onCancel}>Cancel transfer</button>}
+    </div>
+  </motion.article>;
 }

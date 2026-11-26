@@ -6,6 +6,19 @@ import {
   SECURITY_LIMITS,
   Env,
 } from './types';
+import {
+  consume,
+  openLedger,
+  chargeFrame,
+  applyCredit,
+  RELAY_RATE,
+  RELAY_BURST,
+  CONTROL_RATE,
+  MAX_RELAY_FRAME,
+} from './network-v2/relayBudget';
+import { iceServersResponse } from './network-v2/turn';
+import { authorizeTurn, TURN_QUOTA_DDL } from './network-v2/turnAuth';
+import { resolveTurnOrigin } from './index';
 
 /**
  * SignalingHub
@@ -49,6 +62,7 @@ export class SignalingHub extends DurableObject<Env> {
           expires_at INTEGER NOT NULL
         );
       `);
+      this.ctx.storage.sql.exec(TURN_QUOTA_DDL);
     } catch (err) {
       console.error('[SignalingHub SQLite] Database initialization error:', err);
     }
@@ -59,6 +73,39 @@ export class SignalingHub extends DurableObject<Env> {
    */
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    // 0. Authenticated TURN credential endpoint (exact origin check)
+    if (url.pathname === '/api/ice-servers') {
+      const origin = resolveTurnOrigin(request.headers.get('Origin'), this.env.TURN_ALLOWED_ORIGINS);
+      if (!origin) {
+        return new Response(JSON.stringify({ error: 'Forbidden origin' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        });
+      }
+      return iceServersResponse(
+        request,
+        this.env,
+        (room, token, ip) =>
+          authorizeTurn(
+            {
+              query: (sql, ...args) => this.ctx.storage.sql.exec(sql, ...args).toArray(),
+              execute: (sql, ...args) => {
+                this.ctx.storage.sql.exec(sql, ...args);
+              },
+              transaction: (fn) => this.ctx.storage.transactionSync(fn),
+              activeParticipant: (roomCode, id, clientIp) =>
+                this.getRoomSockets(roomCode).some(
+                  (p) => p.meta.id === id && p.meta.ip === clientIp && p.ws.readyState === WebSocket.OPEN
+                ),
+            },
+            room,
+            token,
+            ip
+          ),
+        origin
+      );
+    }
 
     // 1. Health check and telemetry endpoints
     if (url.pathname === '/health' || url.pathname === '/' || url.pathname === '/stats') {
@@ -156,7 +203,12 @@ export class SignalingHub extends DurableObject<Env> {
     serverSocket.serializeAttachment(meta);
 
     // Send immediate welcome handshake
-    this.sendJson(serverSocket, { type: 'welcome', id: clientId });
+    this.sendJson(serverSocket, {
+      type: 'welcome',
+      id: clientId,
+      networkVersion: 2,
+      v2Supported: true,
+    });
 
     return new Response(null, {
       status: 101,
@@ -177,7 +229,121 @@ export class SignalingHub extends DurableObject<Env> {
       return;
     }
 
-    // 1. Message rate limiting (messages per second)
+    // 1. Binary message handling BEFORE legacy JSON limiter
+    if (message instanceof ArrayBuffer) {
+      if (!meta.roomCode) return;
+
+      if (meta.networkVersion === 2) {
+        if (message.byteLength > MAX_RELAY_FRAME) {
+          this.abortRelayTransfer(ws, meta, 'Relay frame exceeds 256 KiB limit');
+          return;
+        }
+
+        // 5-byte credit ACK from receiver -> opposite sender's ledger
+        if (message.byteLength === 5) {
+          const ctrlCheck = consume(meta.controlBucket, 1, CONTROL_RATE, CONTROL_RATE);
+          meta.controlBucket = ctrlCheck.state;
+          if (!ctrlCheck.allowed) {
+            ws.serializeAttachment(meta);
+            this.abortRelayTransfer(ws, meta, 'Control credit rate exceeded');
+            return;
+          }
+
+          const members = this.getRoomSockets(meta.roomCode);
+          const sender = members.find((m) => m.meta.relayLedger?.targetId === meta.id);
+          if (!sender || !sender.meta.relayLedger) {
+            ws.serializeAttachment(meta);
+            this.sendJson(ws, {
+              type: 'error',
+              code: 'RELAY_CREDIT_ERROR',
+              message: 'No active relay ledger for credit',
+            });
+            return;
+          }
+
+          try {
+            const updatedLedger = applyCredit(sender.meta.relayLedger, message);
+            sender.meta.relayLedger = {
+              ...sender.meta.relayLedger,
+              ...updatedLedger,
+            };
+            sender.ws.serializeAttachment(sender.meta);
+            ws.serializeAttachment(meta);
+            sender.ws.send(message);
+          } catch (err) {
+            ws.serializeAttachment(meta);
+            this.abortRelayTransfer(
+              sender.ws,
+              sender.meta,
+              err instanceof Error ? err.message : 'Invalid relay credit'
+            );
+          }
+          return;
+        }
+
+        // >=8-byte binary data frame from sender -> paired recipient
+        const binCheck = consume(meta.binaryBucket, message.byteLength, RELAY_RATE, RELAY_BURST);
+        meta.binaryBucket = binCheck.state;
+        if (!binCheck.allowed) {
+          ws.serializeAttachment(meta);
+          this.abortRelayTransfer(ws, meta, 'Relay bandwidth quota exceeded');
+          return;
+        }
+
+        const ledger = meta.relayLedger;
+        if (!ledger) {
+          ws.serializeAttachment(meta);
+          this.sendJson(ws, {
+            type: 'error',
+            code: 'RELAY_NO_LEDGER',
+            message: 'No active relay transfer ledger',
+          });
+          return;
+        }
+
+        try {
+          const nextLedger = chargeFrame(ledger, message);
+          meta.relayLedger = { ...ledger, ...nextLedger };
+        } catch (err) {
+          ws.serializeAttachment(meta);
+          this.abortRelayTransfer(
+            ws,
+            meta,
+            err instanceof Error ? err.message : 'Invalid relay frame'
+          );
+          return;
+        }
+
+        const members = this.getRoomSockets(meta.roomCode);
+        const target = members.find((m) => m.meta.id === ledger.targetId);
+        if (!target) {
+          ws.serializeAttachment(meta);
+          this.abortRelayTransfer(ws, meta, 'Paired peer disconnected');
+          return;
+        }
+
+        ws.serializeAttachment(meta);
+        target.ws.send(message);
+        return;
+      }
+
+      // Legacy v1 binary forwarding
+      if (message.byteLength > SECURITY_LIMITS.MAX_BINARY_CHUNK_BYTES) {
+        console.warn(`[SignalingHub] Binary chunk exceeded limit (${message.byteLength} bytes)`);
+        return;
+      }
+
+      const members = this.getRoomSockets(meta.roomCode);
+      for (const peer of members) {
+        if (peer.meta.id !== meta.id) {
+          peer.ws.send(message);
+        }
+      }
+      ws.serializeAttachment(meta);
+      return;
+    }
+
+    // 2. Legacy per-second message rate limit + token-bucket control limiter for JSON
     const now = Date.now();
     if (now - meta.lastMessageReset > 1000) {
       meta.messageCount = 1;
@@ -195,29 +361,9 @@ export class SignalingHub extends DurableObject<Env> {
       }
     }
 
-    // 2. Binary message handling (direct file chunk relay between paired peers)
-    if (message instanceof ArrayBuffer) {
-      if (!meta.roomCode) return;
-
-      if (message.byteLength > SECURITY_LIMITS.MAX_BINARY_CHUNK_BYTES) {
-        console.warn(`[SignalingHub] Binary chunk exceeded limit (${message.byteLength} bytes)`);
-        return;
-      }
-
-      // Forward directly to paired peer in same room
-      const members = this.getRoomSockets(meta.roomCode);
-      for (const peer of members) {
-        if (peer.meta.id !== meta.id) {
-          peer.ws.send(message);
-        }
-      }
-      ws.serializeAttachment(meta);
-      return;
-    }
-
-    // 3. String / JSON payload validation
+    // 3. String / UTF-8 byte size validation & JSON parsing
     const rawString = typeof message === 'string' ? message : new TextDecoder().decode(message);
-    if (rawString.length > SECURITY_LIMITS.MAX_JSON_PAYLOAD_BYTES) {
+    if (new TextEncoder().encode(rawString).byteLength > SECURITY_LIMITS.MAX_JSON_PAYLOAD_BYTES) {
       this.sendJson(ws, {
         type: 'error',
         code: 'PAYLOAD_TOO_LARGE',
@@ -245,6 +391,21 @@ export class SignalingHub extends DurableObject<Env> {
       return;
     }
 
+    // Control token bucket check (bypass for initial register / join-room / ping which have own guards)
+    if (msg.type !== 'register' && msg.type !== 'join-room' && msg.type !== 'ping' && msg.type !== 'signal') {
+      const ctrlCheck = consume(meta.controlBucket, 1, CONTROL_RATE, CONTROL_RATE, now);
+      meta.controlBucket = ctrlCheck.state;
+      if (!ctrlCheck.allowed) {
+        this.sendJson(ws, {
+          type: 'error',
+          code: 'CONTROL_RATE_LIMIT',
+          message: 'Control message rate exceeded.',
+        });
+        ws.serializeAttachment(meta);
+        return;
+      }
+    }
+
     // 4. Protocol Dispatch
     switch (msg.type) {
       case 'register': {
@@ -254,6 +415,7 @@ export class SignalingHub extends DurableObject<Env> {
         if (msg.deviceType === 'mobile' || msg.deviceType === 'desktop') {
           meta.deviceType = msg.deviceType;
         }
+        meta.networkVersion = msg.networkVersion === 2 ? 2 : 1;
         ws.serializeAttachment(meta);
         if (meta.roomCode) {
           this.broadcastRoomPeers(meta.roomCode);
@@ -435,6 +597,8 @@ export class SignalingHub extends DurableObject<Env> {
         meta.isHost = rotated.isHost;
         meta.name = rotated.name;
         meta.deviceType = rotated.deviceType;
+        meta.relayPending = undefined;
+        meta.relayLedger = undefined;
         ws.serializeAttachment(meta);
 
         this.saveRoom(roomCode, meta.id);
@@ -454,16 +618,49 @@ export class SignalingHub extends DurableObject<Env> {
       case 'leave-room': {
         const oldRoom = meta.roomCode;
         const oldId = meta.id;
+        const activeTransferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
         meta.roomCode = '';
         meta.isHost = false;
+        meta.relayPending = undefined;
+        meta.relayLedger = undefined;
         ws.serializeAttachment(meta);
 
         this.deleteCredential(oldId);
 
         if (oldRoom) {
+          if (activeTransferId) {
+            this.notifyRoomTransferAborted(oldRoom, oldId, activeTransferId, 'Peer left room');
+          }
           this.broadcastRoomPeers(oldRoom);
           this.cleanUpRoomIfEmpty(oldRoom);
         }
+        break;
+      }
+
+      case 'v2-path': {
+        if (
+          meta.roomCode &&
+          typeof msg.epoch === 'string' &&
+          msg.epoch.length <= 64 &&
+          (msg.path === 'rtc' || msg.path === 'relay') &&
+          typeof msg.stage === 'string'
+        ) {
+          const members = this.getRoomSockets(meta.roomCode);
+          const target =
+            typeof msg.to === 'string'
+              ? members.find((m) => m.meta.id === msg.to && m.meta.id !== meta.id)
+              : members.find((m) => m.meta.id !== meta.id);
+          if (target) {
+            this.sendJson(target.ws, {
+              type: 'v2-path',
+              from: meta.id,
+              epoch: msg.epoch,
+              path: msg.path,
+              stage: msg.stage,
+            });
+          }
+        }
+        ws.serializeAttachment(meta);
         break;
       }
 
@@ -488,16 +685,147 @@ export class SignalingHub extends DurableObject<Env> {
 
       case 'relay': {
         if (meta.roomCode) {
-          // Security isolation: only relay payloads between paired peers in the same room
           const members = this.getRoomSockets(meta.roomCode);
-          for (const peer of members) {
-            if (peer.meta.id !== meta.id) {
-              this.sendJson(peer.ws, {
+          const peers = members.filter((m) => m.meta.id !== meta.id);
+          const payload = msg.payload as Record<string, unknown> | undefined;
+
+          if (payload && typeof payload === 'object' && typeof payload.type === 'string') {
+            if (payload.type === 'v2-meta') {
+              const target = peers[0];
+              const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
+              const fileId = Number(payload.fileId);
+              const size = Number(payload.size);
+              const chunkSize = Number(payload.chunkSize);
+              if (
+                !target ||
+                !transferId ||
+                !Number.isInteger(fileId) ||
+                fileId < 0 ||
+                fileId > 65535 ||
+                !Number.isSafeInteger(size) ||
+                size < 0 ||
+                !Number.isSafeInteger(chunkSize) ||
+                chunkSize < 1 ||
+                chunkSize > MAX_RELAY_FRAME - 8
+              ) {
+                this.sendJson(ws, {
+                  type: 'error',
+                  code: 'RELAY_INVALID_META',
+                  message: 'Invalid v2 relay metadata',
+                  transferId,
+                });
+                ws.serializeAttachment(meta);
+                return;
+              }
+              meta.relayPending = {
+                transferId,
+                fileId,
+                size,
+                chunkSize,
+                targetId: target.meta.id,
+              };
+              meta.relayLedger = undefined;
+              ws.serializeAttachment(meta);
+              this.sendJson(target.ws, {
                 type: 'relay',
                 from: meta.id,
                 payload: msg.payload,
               });
+              return;
             }
+
+            if (payload.type === 'v2-ready') {
+              const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
+              const sender = peers.find(
+                (p) => p.meta.relayPending?.transferId === transferId && p.meta.relayPending.targetId === meta.id
+              );
+              if (sender && sender.meta.relayPending) {
+                const pend = sender.meta.relayPending;
+                sender.meta.relayPending = undefined;
+                if (payload.ok === true) {
+                  const ledger = openLedger(pend.fileId, pend.size, pend.chunkSize);
+                  sender.meta.relayLedger = {
+                    ...ledger,
+                    transferId: pend.transferId,
+                    targetId: meta.id,
+                    totalSize: pend.size,
+                  };
+                } else {
+                  sender.meta.relayLedger = undefined;
+                }
+                sender.ws.serializeAttachment(sender.meta);
+                ws.serializeAttachment(meta);
+                this.sendJson(sender.ws, {
+                  type: 'relay',
+                  from: meta.id,
+                  payload: msg.payload,
+                });
+                return;
+              }
+            }
+
+            if (payload.type === 'v2-end') {
+              const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
+              if (meta.relayLedger && meta.relayLedger.transferId === transferId) {
+                if (meta.relayLedger.remaining !== 0) {
+                  this.abortRelayTransfer(ws, meta, 'Premature v2-end before all bytes sent');
+                  return;
+                }
+              }
+            }
+
+            if (payload.type === 'v2-result') {
+              const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
+              const sender = peers.find((p) => p.meta.relayLedger?.transferId === transferId);
+              if (sender && sender.meta.relayLedger) {
+                const led = sender.meta.relayLedger;
+                if (payload.ok === true) {
+                  const validDigest =
+                    typeof payload.digest === 'string' && /^[0-9a-fA-F]{64}$/.test(payload.digest);
+                  if (
+                    led.remaining !== 0 ||
+                    led.outstanding !== 0 ||
+                    Number(payload.size) !== led.totalSize ||
+                    !validDigest
+                  ) {
+                    sender.meta.relayLedger = undefined;
+                    sender.ws.serializeAttachment(sender.meta);
+                    this.sendJson(ws, {
+                      type: 'error',
+                      code: 'RELAY_RESULT_INVALID',
+                      message: 'Result rejected: ledger not settled',
+                      transferId,
+                    });
+                    ws.serializeAttachment(meta);
+                    return;
+                  }
+                }
+                sender.meta.relayLedger = undefined;
+                sender.ws.serializeAttachment(sender.meta);
+              }
+            }
+
+            if (payload.type === 'v2-cancel') {
+              const transferId = typeof payload.transferId === 'string' ? payload.transferId : '';
+              if (meta.relayLedger?.transferId === transferId) meta.relayLedger = undefined;
+              if (meta.relayPending?.transferId === transferId) meta.relayPending = undefined;
+              for (const p of peers) {
+                if (p.meta.relayLedger?.transferId === transferId || p.meta.relayPending?.transferId === transferId) {
+                  p.meta.relayLedger = undefined;
+                  p.meta.relayPending = undefined;
+                  p.ws.serializeAttachment(p.meta);
+                }
+              }
+            }
+          }
+
+          // Forward relay payload exclusively to paired peer(s) in the same room
+          for (const peer of peers) {
+            this.sendJson(peer.ws, {
+              type: 'relay',
+              from: meta.id,
+              payload: msg.payload,
+            });
           }
         }
         ws.serializeAttachment(meta);
@@ -525,11 +853,13 @@ export class SignalingHub extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     let oldRoom = '';
     let participantId = '';
+    let activeTransferId: string | undefined;
     try {
       const meta = ws.deserializeAttachment() as ClientMeta | null;
       if (meta?.roomCode) {
         oldRoom = meta.roomCode;
         participantId = meta.id;
+        activeTransferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
       }
     } catch {
       // Ignore
@@ -542,6 +872,9 @@ export class SignalingHub extends DurableObject<Env> {
     }
 
     if (oldRoom && participantId) {
+      if (activeTransferId) {
+        this.notifyRoomTransferAborted(oldRoom, participantId, activeTransferId, 'Peer disconnected');
+      }
       await this.markCredentialGrace(participantId);
       this.broadcastRoomPeers(oldRoom);
       this.cleanUpRoomIfEmpty(oldRoom);
@@ -590,6 +923,47 @@ export class SignalingHub extends DurableObject<Env> {
   }
 
   // --- Helper Methods ---
+
+  private notifyRoomTransferAborted(
+    roomCode: string,
+    fromId: string,
+    transferId: string,
+    reason: string
+  ): void {
+    const members = this.getRoomSockets(roomCode);
+    for (const m of members) {
+      if (m.meta.id !== fromId) {
+        if (m.meta.relayLedger?.transferId === transferId || m.meta.relayPending?.transferId === transferId) {
+          m.meta.relayLedger = undefined;
+          m.meta.relayPending = undefined;
+          m.ws.serializeAttachment(m.meta);
+        }
+        this.sendJson(m.ws, {
+          type: 'relay',
+          from: fromId,
+          payload: { type: 'v2-cancel', transferId, reason },
+        });
+      }
+    }
+  }
+
+  private abortRelayTransfer(ws: WebSocket, meta: ClientMeta, reason: string): void {
+    const transferId = meta.relayLedger?.transferId ?? meta.relayPending?.transferId;
+    meta.relayLedger = undefined;
+    meta.relayPending = undefined;
+    ws.serializeAttachment(meta);
+
+    this.sendJson(ws, {
+      type: 'error',
+      code: 'RELAY_ABORTED',
+      message: reason,
+      ...(transferId ? { transferId } : {}),
+    });
+
+    if (meta.roomCode && transferId) {
+      this.notifyRoomTransferAborted(meta.roomCode, meta.id, transferId, reason);
+    }
+  }
 
   private sendJson(ws: WebSocket, data: ServerMessage): void {
     try {
@@ -642,6 +1016,7 @@ export class SignalingHub extends DurableObject<Env> {
           id: m.meta.id,
           name: m.meta.name,
           deviceType: m.meta.deviceType,
+          networkVersion: m.meta.networkVersion ?? 1,
         }));
 
       this.sendJson(member.ws, {

@@ -1,0 +1,17 @@
+/* Only existing animation surfaces are affected. No root tokens, page layout, header or fonts. */
+.ld .ldf-handshake { background:transparent; backdrop-filter:none; pointer-events:none; }
+.ld .ldf-handshake .ld-handshake-sheet { pointer-events:none; }
+.ld .ldf-handshake .ld-dismiss { pointer-events:auto; min-width:44px; min-height:44px; }
+.ld .ldf-handshake .ldf-peer-device { background:var(--accent-soft); }
+.ld .ldf-handshake .ld-device { min-width:0; }
+.ld .ldf-handshake .ld-bridge { min-width:32px; flex:1 1 100px; max-width:120px; }
+.ld .ldf-handshake p { overflow-wrap:anywhere; }
+.ld .ldf-transfer .ld-transfer-art { min-width:0; }
+.ld .ldf-scene { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.4fr) minmax(0,1fr); align-items:center; gap:0; padding:8px 9px; min-width:0; }
+.ld .ldf-scene-device { min-width:0; display:grid; justify-items:center; gap:0; }
+.ld .ldf-scene-device svg { width:100%; max-width:92px; height:auto; display:block; }
+.ld .ldf-scene-device small { font-size:10px; line-height:1.3; text-align:center; color:var(--muted); white-space:normal; }
+.ld .ldf-flight { display:block; width:100%; height:auto; overflow:hidden; }
+.ld .ldf-transfer .ld-progress-fill { transform-origin:left center; }
+.ld .ldf-cancel { min-height:44px; margin-top:6px; }
+@media(prefers-reduced-motion:reduce) { .ld .ldf-handshake,.ld .ldf-transfer { scroll-behavior:auto; } }

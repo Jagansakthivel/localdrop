@@ -1,0 +1,74 @@
+/* LocalDrop Type Finish — import last, after Motion Finale.
+   Existing palette, dimensions, layout and motion remain the source of truth. */
+.ld {
+  --ldt-display: 'Manrope Variable', 'Geist Variable', system-ui, sans-serif;
+  --ldt-text: 'Geist Variable', system-ui, sans-serif;
+  --ldt-mono: 'Geist Mono Variable', ui-monospace, monospace;
+  font-family: var(--ldt-text);
+  font-optical-sizing: auto;
+  font-kerning: normal;
+  font-synthesis: none;
+}
+/* Preserve existing responsive font sizes on the brand and hero. */
+.ld .ldx-brand { font-family: var(--ldt-display); font-weight: 780; letter-spacing: -.048em; }
+.ld .ld-intro h1 { font-family: var(--ldt-display); font-weight: 740; letter-spacing: -.058em; line-height: 1.06; }
+.ld .ld-intro h1 em { font-weight: inherit; }
+.ld .ld-peer h1 { font-family: var(--ldt-display); font-weight: 710; letter-spacing: -.042em; line-height: 1.16; overflow-wrap: anywhere; }
+.ld .ld-drop h2, .ld .ld-activity, .ld .ld-handshake-sheet h2,
+.ld .ld-incoming-card h2, .ld .ld-modal-title {
+  font-family: var(--ldt-display); font-weight: 720; letter-spacing: -.036em; line-height: 1.2;
+}
+.ld .ld-stack h3 { font-family: var(--ldt-display); font-weight: 700; letter-spacing: -.03em; line-height: 1.25; }
+.ld .ld-intro p, .ld .ld-drop p, .ld .ld-incoming-card p, .ld .ld-handshake-sheet p {
+  font-family: var(--ldt-text); font-weight: 440; letter-spacing: -.006em; line-height: 1.55; text-wrap: pretty;
+}
+/* Less shouty metadata. JSX strings should be sentence case, not CSS title-cased. */
+.ld .ld-kicker, .ld .ld-incoming-kicker, .ld .ldx-popover-eyebrow {
+  font-family: var(--ldt-text); font-size: 12px; font-weight: 580;
+  letter-spacing: .012em; line-height: 1.4; text-transform: none; color: var(--muted);
+}
+.ld .ld-transfer-status { font-weight: 600; }
+.ld .ldx-status, .ld .ldx-device-name, .ld .ld-label, .ld .ld-connect label,
+.ld .ld-clip label, .ld .ld-staged-header { font-weight: 570; letter-spacing: -.008em; line-height: 1.4; }
+/* Use optical weight hierarchy, not bold on every control. */
+.ld .ld-actions button, .ld .ld-quiet, .ld .segment, .ld .ld-text-button,
+.ld .ld-incoming-decline, .ld .ldx-footer-links a { font-family: var(--ldt-text); font-weight: 560; letter-spacing: -.009em; line-height: 1.35; }
+.ld .ld-primary, .ld .ld-incoming-accept { font-family: var(--ldt-text); font-weight: 640; letter-spacing: -.012em; line-height: 1.35; }
+.ld .segment[aria-selected='true'] { font-weight: 630; }
+/* PIN is intentionally still prominent; preserve existing responsive font-size. */
+.ld .ld-pin, .ld .pairing-code, .ld .ld-inputrow input {
+  font-family: var(--ldt-mono); font-weight: 530; font-variant-numeric: lining-nums tabular-nums slashed-zero;
+  font-feature-settings: normal; letter-spacing: .075em;
+}
+.ld .ld-number, .ld .ld-activity > span, .ld .ldt-number, .ld .ldt-size,
+.ld .ld-extension { font-family: var(--ldt-mono); font-variant-numeric: lining-nums tabular-nums; font-feature-settings: normal; letter-spacing: -.025em; }
+.ld .ldt-size, .ld .ldt-number { font-weight: 480; }
+.ld .ld-transfer-name, .ld .ldv-filename, .ld .ld-file strong, .ld .ld-incoming-file-details strong {
+  font-family: var(--ldt-text); font-weight: 600; letter-spacing: -.013em; line-height: 1.4;
+}
+.ld .ldv-meta, .ld .ld-file small, .ld .ld-transfer-meta, .ld .ld-metrics,
+.ld .ld-incoming-file-details span, .ld .ldf-scene-device small {
+  font-family: var(--ldt-text); font-weight: 440; letter-spacing: 0; line-height: 1.45;
+  font-variant-numeric: tabular-nums; color: var(--muted);
+}
+.ld .ld-metrics .ld-number { font-family: var(--ldt-mono); font-weight: 580; color: var(--ink); }
+.ld .ldv-meta .ldt-size { font-size: inherit; }
+.ld .ldv-filename { min-width: 0; }
+.ld .ld-transfer-name, .ld .ld-incoming-file-details { min-width: 0; overflow-wrap: anywhere; }
+/* Scope icon adjustments to small Lucide controls; never touch custom motion SVGs,
+   QR codes, brand mark, footer signature, filled recording glyphs or focus outlines. */
+.ld .segment-content > svg.lucide,
+.ld .ld-actions button > svg.lucide,
+.ld .ldx-icon-button > svg.lucide,
+.ld .ldx-device-icon > svg.lucide,
+.ld .ldv-file-mark > svg.lucide,
+.ld .ld-incoming-actions button > svg.lucide { flex-shrink: 0; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+.ld .ld-primary > svg.lucide, .ld .ld-incoming-accept > svg.lucide { stroke-width: 1.9; }
+.ld .ldx-footer p, .ld .ldx-footer-links a { font-size: 12px; line-height: 1.5; letter-spacing: -.005em; }
+.ld .ldx-signature { font-weight: 660; }
+/* No scaling down controls on small screens. Prevent iOS focus zoom on text inputs. */
+@media (max-width: 600px) {
+  .ld .ld-clip textarea { font-size: 16px; line-height: 1.5; }
+  .ld .ld-peer h1 { letter-spacing: -.035em; }
+  .ld .ld-intro h1 { letter-spacing: -.05em; }
+}

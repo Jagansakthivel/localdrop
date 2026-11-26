@@ -1,0 +1,67 @@
+import { ABORT, DATA, EOF, WINDOW, checkAbort, creditFrame, decode, encode, validateMeta, type FileMeta } from './wire';
+import { CreditWindow, waitChannel, waitSocket } from './flow';
+import { Sha256 } from './sha256';
+import { createRelayPacer } from './relayPacer';
+import type { FileSink } from './fileSink';
+export type TransferPath = { kind:'rtc'; bulk: readonly RTCDataChannel[] } | { kind:'relay'; socket: WebSocket };
+export interface EndMessage { type:'v2-end'; transferId:string; digest:string; size:number }
+export interface ResultMessage { type:'v2-result'; transferId:string; ok:boolean; size:number; digest?:string; reason?:string }
+export interface SendOptions { meta:FileMeta; file:File; path:TransferPath; credit:CreditWindow; signal:AbortSignal; record:(bytes:number,waitMs:number)=>void }
+// Call only after receiver v2-ready. All writes use the exact path captured at metadata time.
+// A single sequential reader hashes in file order and stripes frames across four streams.
+export async function sendPayload(o:SendOptions):Promise<EndMessage>{
+  const {meta,file,path,credit,signal,record}=o;const count=validateMeta(meta);
+  checkAbort(signal);
+  if(file.size!==meta.size)throw new Error('File size changed');
+  if(path.kind==='rtc'&&(path.bulk.length!==4 || new Set(path.bulk).size!==4 || path.bulk.some(c=>c.readyState!=='open')))throw new Error('Bulk channels not ready');
+  const sha=new Sha256();const pace=createRelayPacer();
+  for(let index=0;index<count;index++){
+    checkAbort(signal);const offset=index*meta.chunkSize;const size=Math.min(meta.chunkSize,file.size-offset);const start=performance.now();
+    await credit.take(size,signal);
+    const channel=path.kind==='rtc'?path.bulk[index%4]:undefined;
+    if(channel)await waitChannel(channel,size+8,signal);else if(path.kind==='relay'){await pace(size+8,signal);await waitSocket(path.socket,size+8,signal);}
+    const waited=performance.now()-start;checkAbort(signal);
+    const bytes=new Uint8Array(await file.slice(offset,offset+size).arrayBuffer());checkAbort(signal);
+    if(bytes.byteLength!==size)throw new Error('Unexpected file read length');
+    sha.update(bytes);const frame=encode(meta.fileId,index,index===count-1?EOF:DATA,bytes);
+    if(channel){if(channel.readyState!=='open')throw new Error('Bulk channel closed');channel.send(frame);}
+    else if(path.kind==='relay'){if(path.socket.readyState!==WebSocket.OPEN)throw new Error('Relay closed');path.socket.send(frame);}
+    record(size,waited);
+  }
+  return {type:'v2-end',transferId:meta.transferId,digest:sha.digest(),size:file.size};
+}
+export interface ReceiveOptions { meta:FileMeta; sink:FileSink; signal:AbortSignal; sendCredit:(frame:ArrayBuffer)=>void; record:(bytes:number)=>void; result:(r:ResultMessage,file?:File)=>void }
+// One accepted transfer per direction. Credit bounds all four channels together.
+// No acknowledgement of completion until the sink is committed AND the digest matches.
+export function createReceiver(o:ReceiveOptions){
+  const {meta,sink,signal,sendCredit,record,result}=o;const count=validateMeta(meta);const sha=new Sha256();
+  const pending=new Map<number,Uint8Array>();let pendingBytes=0,next=0,written=0,credit=0,done=false,writing=false,finishing=false,terminal:EndMessage|undefined;
+  let activeWrite:Promise<void>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;
+  const cleanup=()=>{clearTimeout(timer);signal.removeEventListener('abort',onAbort);};
+  function resetTimer(){clearTimeout(timer);timer=setTimeout(()=>void fail(new Error('Receiver transfer stalled')),30000);}
+  async function fail(reason:unknown){if(done)return;done=true;cleanup();pending.clear();pendingBytes=0;await activeWrite?.catch(()=>{});await sink.abort().catch(()=>{});result({type:'v2-result',transferId:meta.transferId,ok:false,size:written,reason:reason instanceof Error?reason.message:'Transfer aborted'});}
+  const onAbort=()=>void fail(signal.reason??new Error('Aborted'));
+  async function complete(){
+    if(done||writing||finishing||!terminal||next!==count)return;
+    finishing=true;
+    try{checkAbort(signal);if(written!==meta.size||terminal.size!==written)throw new Error('File size mismatch');const digest=sha.digest();if(digest!==terminal.digest.toLowerCase())throw new Error('SHA-256 mismatch');
+      // Keep storage until the vault item is removed. Caller owns sink.dispose().
+      const file=await sink.finish();if(done){await sink.dispose();return;}done=true;cleanup();result({type:'v2-result',transferId:meta.transferId,ok:true,size:written,digest},file);
+    }catch(e){await fail(e);}
+  }
+  async function drain(){if(writing||done)return;writing=true;
+    try{while(!done&&pending.has(next)){checkAbort(signal);const bytes=pending.get(next)!;activeWrite=sink.write(bytes);await activeWrite;activeWrite=undefined;if(done)return;sha.update(bytes);pending.delete(next);pendingBytes-=bytes.length;next++;written+=bytes.length;credit+=bytes.length;record(bytes.length);resetTimer();if(credit>=1024*1024||written===meta.size){sendCredit(creditFrame(credit));credit=0;}}}
+    catch(e){writing=false;await fail(e);return;}finally{writing=false;}
+    await complete();
+  }
+  signal.addEventListener('abort',onAbort,{once:true});resetTimer();if(signal.aborted)onAbort();
+  return {
+    push(frame:ArrayBuffer){if(done)return;try{checkAbort(signal);const f=decode(frame);if(f.id!==meta.fileId)throw new Error('Unexpected file id');if(f.flag===ABORT){void fail(new Error('Peer cancelled'));return;}
+      if(f.index>=count||f.index<next||pending.has(f.index))throw new Error('Invalid or duplicate chunk index');
+      const expected=Math.min(meta.chunkSize,meta.size-f.index*meta.chunkSize);if(f.payload.length!==expected||f.flag!==(f.index===count-1?EOF:DATA))throw new Error('Invalid chunk size or flags');
+      if(pendingBytes+f.payload.length>WINDOW)throw new Error('Receiver credit window exceeded');pending.set(f.index,f.payload);pendingBytes+=f.payload.length;resetTimer();void drain();
+    }catch(e){void fail(e);}},
+    end(msg:EndMessage){if(done)return;if(terminal||msg.transferId!==meta.transferId||msg.size!==meta.size||!/^[0-9a-fA-F]{64}$/u.test(msg.digest)){void fail(new Error('Invalid end message'));return;}terminal=msg;resetTimer();void complete();},
+    abort(reason:unknown=new Error('Cancelled')){return fail(reason);},
+  };
+}

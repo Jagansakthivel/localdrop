@@ -20,4 +20,13 @@ export interface NetworkDiagnostics {
   peerState: RTCPeerConnectionState | null;
   channelState: RTCDataChannelState | null;
   lastError: string | null;
+  pathKind?: 'webrtc-lan' | 'webrtc-wan' | 'webrtc-turn' | 'webrtc-unknown' | 'ws-relay';
+  localCandidateType?: string;
+  remoteCandidateType?: string;
+  candidateProtocol?: string;
+  signalingSetupMs?: number;
+  iceSetupMs?: number;
+  bufferWaitRatio?: number;
+  receiverConfirmedBytes?: number;
+  transferElapsedMs?: number;
 }

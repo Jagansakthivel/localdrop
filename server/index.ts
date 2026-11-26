@@ -11,6 +11,7 @@ interface ClientMeta {
   ip: string;
   messageCount: number;
   lastMessageReset: number;
+  networkVersion?: number;
   ws: WebSocket;
 }
 
@@ -236,7 +237,12 @@ function broadcastRoomPeers(roomCode: string) {
   for (const member of members) {
     const others = members
       .filter((m) => m.id !== member.id)
-      .map(({ id, name, deviceType }) => ({ id, name, deviceType }));
+      .map(({ id, name, deviceType, networkVersion }) => ({
+        id,
+        name,
+        deviceType,
+        networkVersion: networkVersion ?? 1,
+      }));
 
     if (member.ws.readyState === WebSocket.OPEN) {
       member.ws.send(
@@ -279,7 +285,7 @@ wss.on('connection', (ws, req) => {
   clients.set(id, client);
 
   // Send initial welcome message with client ID
-  ws.send(JSON.stringify({ type: 'welcome', id }));
+  ws.send(JSON.stringify({ type: 'welcome', id, networkVersion: 2, v2Supported: true }));
 
   ws.on('message', (raw, isBinary) => {
     aliveClients.set(ws, true);
@@ -360,8 +366,31 @@ wss.on('connection', (ws, req) => {
       if (msg.deviceType === 'mobile' || msg.deviceType === 'desktop') {
         client.deviceType = msg.deviceType;
       }
+      client.networkVersion = msg.networkVersion === 2 ? 2 : 1;
       if (client.roomCode) {
         broadcastRoomPeers(client.roomCode);
+      }
+    } else if (msg.type === 'v2-path') {
+      if (
+        client.roomCode &&
+        typeof msg.epoch === 'string' &&
+        (msg.path === 'rtc' || msg.path === 'relay') &&
+        typeof msg.stage === 'string'
+      ) {
+        const peers = getRoomMembers(client.roomCode).filter((m) => m.id !== client.id);
+        const target =
+          typeof msg.to === 'string' ? peers.find((m) => m.id === msg.to) : peers[0];
+        if (target && target.ws.readyState === WebSocket.OPEN) {
+          target.ws.send(
+            JSON.stringify({
+              type: 'v2-path',
+              from: client.id,
+              epoch: msg.epoch,
+              path: msg.path,
+              stage: msg.stage,
+            })
+          );
+        }
       }
     } else if (msg.type === 'create-room') {
       const roomCode = String(msg.roomCode || '').trim();

@@ -61,7 +61,7 @@ export function ActivityRow({
           {split && <span>{name.slice(dot)}</span>}
         </div>
         <div className="ldv-meta">
-          {size} · {label}
+          <span className="ldt-size">{size}</span> · {label}
           {detail && ` · ${detail}`}
         </div>
         {active && <progress max={100} value={pct} aria-label={`Transfer progress: ${name}`} />}

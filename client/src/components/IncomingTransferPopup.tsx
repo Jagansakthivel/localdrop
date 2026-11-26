@@ -215,7 +215,7 @@ export function IncomingTransferPopup({
 
             <span className="ld-incoming-kicker">
               <span className="ld-incoming-dot" />
-              TRANSFER REQUEST
+              Transfer request
             </span>
 
             {/* Device transfer illustration */}
@@ -243,9 +243,9 @@ export function IncomingTransferPopup({
                           }
                     }
                     transition={{
-                      duration: 1.2,
-                      repeat: reducedMotion ? 0 : Infinity,
-                      delay: index * 0.18,
+                      duration: 0.65,
+                      repeat: reducedMotion ? 0 : 1,
+                      delay: index * 0.1,
                     }}
                   />
                 ))}
@@ -263,7 +263,7 @@ export function IncomingTransferPopup({
             </div>
 
             {/* Request details */}
-            <h2 id="ld-incoming-title">Incoming transfer</h2>
+            <h2 id="ld-incoming-title">Incoming file</h2>
 
             <p id="ld-incoming-description">
               <strong>{activeOffer.senderName}</strong>
@@ -288,7 +288,7 @@ export function IncomingTransferPopup({
               </div>
             </div>
 
-            <p className="ld-incoming-note">Only accept files you are expecting.</p>
+            <p className="ld-incoming-note">Only accept files you trust.</p>
 
             {/* Decision buttons */}
             <div className="ld-incoming-actions">
@@ -301,7 +301,7 @@ export function IncomingTransferPopup({
                 onClick={() => void respond('declined')}
               >
                 <X size={17} />
-                {decision === 'declined' ? 'Declining...' : 'Decline'}
+                {decision === 'declined' ? 'Declining…' : 'Decline'}
               </motion.button>
 
               <motion.button
@@ -316,7 +316,7 @@ export function IncomingTransferPopup({
                 ) : (
                   <ArrowDownToLine size={18} />
                 )}
-                {decision === 'accepted' ? 'Accepting...' : 'Accept'}
+                {decision === 'accepted' ? 'Accepting…' : 'Accept'}
               </motion.button>
             </div>
 

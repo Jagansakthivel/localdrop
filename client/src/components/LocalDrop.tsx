@@ -38,6 +38,7 @@ import { getTransportCopy } from '../utils/transportCopy';
 import type { SaveFileHandle } from '../utils/saveReceivedFile';
 import '../localdrop.css';
 import './mobile-refinement.css';
+import './type-finish.css';
 
 export type Transfer = {
   id: string;
@@ -47,6 +48,8 @@ export type Transfer = {
   direction: 'send' | 'receive';
   status: string;
   transferState?: ActivityState;
+  awaitingApproval?: boolean;
+  paused?: boolean;
   file?: File | null;
 };
 
@@ -131,7 +134,7 @@ function StandardFileList({
   return (
     <div className="ld-staged-queue mt-3">
       <div className="ld-staged-header">
-        <span>Ready to dispatch ({files.length})</span>
+        <span>Ready to send ({files.length})</span>
       </div>
       <div className="max-h-48 overflow-y-auto">
         {files.map((sf) => (
@@ -331,6 +334,13 @@ export default function LocalDrop(p: Props) {
             connectionId={p.channelSessionId}
             peerName={p.peer || 'Connected Peer'}
             peerIsPhone={p.peerIsPhone}
+            localIsPhone={isReceiverMobile}
+            ready={
+              !p.incomingOffer &&
+              Boolean(p.peer) &&
+              (p.connectionState === 'direct' ||
+                (p.connectionState === 'relayed' && p.wsConnected))
+            }
           />
         </MotionErrorBoundary>
 
@@ -378,14 +388,14 @@ export default function LocalDrop(p: Props) {
               >
                 <div className="ld-intro">
                   <span className="ld-kicker">
-                    <span className="ld-dot" /> DEVICE PAIRING
+                    <span className="ld-dot" /> Pair a device
                   </span>
                   <h1>
                     From here.
                     <br />
                     <em>To there.</em>
                   </h1>
-                  <p>Connect another device to send files and share your clipboard.</p>
+                  <p>Share files and text with another device.</p>
                 </div>
 
                 {/* Pairing Ticket */}
@@ -459,7 +469,7 @@ export default function LocalDrop(p: Props) {
                               fgColor="#252723"
                             />
                             <span className="text-[11px] text-[var(--muted)] mt-2">
-                              Scan with phone camera to connect
+                              Scan with your camera to pair
                             </span>
                           </div>
                         </motion.div>
@@ -476,13 +486,13 @@ export default function LocalDrop(p: Props) {
                     if (/^\d{4}$/.test(code) && p.wsConnected) p.onConnect(code);
                   }}
                 >
-                  <label htmlFor="ld-code">Have a code from another device?</label>
+                  <label htmlFor="ld-code">Enter the other device’s code</label>
                   <div className="ld-inputrow">
                     <input
                       id="ld-code"
                       inputMode="numeric"
                       autoComplete="off"
-                      placeholder={p.wsConnected ? '0000' : 'Starting server…'}
+                      placeholder={p.wsConnected ? '0000' : 'Connecting to server…'}
                       maxLength={4}
                       value={code}
                       disabled={!p.wsConnected}
@@ -496,7 +506,7 @@ export default function LocalDrop(p: Props) {
                       {p.connecting
                         ? 'Connecting…'
                         : !p.wsConnected
-                          ? 'Starting server…'
+                          ? 'Connecting to server…'
                           : 'Connect'}
                       <ArrowUpRight size={19} />
                     </motion.button>
@@ -594,10 +604,10 @@ export default function LocalDrop(p: Props) {
 
                         <h2>
                           <span className="ldv-desktop-title">
-                            {drag ? 'Release to send' : 'Drop it here.'}
+                            {drag ? 'Release to add files' : 'Drop it here.'}
                           </span>
                           <span className="ldv-touch-title">
-                            {drag ? 'Release to send' : 'Send files'}
+                            {drag ? 'Release to add files' : 'Send files'}
                           </span>
                         </h2>
                         <p>{tCopy.dropSubtitle}</p>
@@ -633,7 +643,7 @@ export default function LocalDrop(p: Props) {
                               ) : (
                                 <>
                                   <Mic size={17} />
-                                  <span>Voice Note</span>
+                                  <span>Voice note</span>
                                 </>
                               )}
                             </button>
@@ -700,7 +710,7 @@ export default function LocalDrop(p: Props) {
                                 onClick={p.onSendStaged}
                                 className="ld-primary text-xs !py-2 !px-4"
                               >
-                                Send All ({p.stagedFiles.length}) <ArrowUpRight size={15} />
+                                Send all ({p.stagedFiles.length}) <ArrowUpRight size={15} />
                               </motion.button>
                             )}
                           </div>
@@ -728,7 +738,7 @@ export default function LocalDrop(p: Props) {
                       <label htmlFor="ld-clip">Share text or a link with {p.peer}</label>
                       <textarea
                         id="ld-clip"
-                        placeholder="Paste URLs, code, or markdown to beam immediately..."
+                        placeholder="Paste text or a link…"
                         value={clip}
                         onChange={(e) => setClip(e.target.value)}
                       />
@@ -751,7 +761,7 @@ export default function LocalDrop(p: Props) {
                         <div>
                           <h3 className="font-bold text-lg">Session Vault</h3>
                           <p className="text-xs text-[var(--muted)]">
-                            All items exchanged during this session ({p.sharedItems.length})
+                            Shared in this session ({p.sharedItems.length})
                           </p>
                         </div>
 
@@ -838,27 +848,27 @@ export default function LocalDrop(p: Props) {
                     >
                       <h3 className="font-bold text-lg mb-2">Network Diagnostics</h3>
                       <p className="text-xs text-[var(--muted)] mb-5">
-                        Real-time WebRTC telemetry and channel metrics
+                        Connection and transfer details
                       </p>
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
-                          <span className="text-[var(--muted)] block mb-1">Active Transport</span>
+                          <span className="text-[var(--muted)] block mb-1">Active transport</span>
                           <strong className="text-sm font-semibold">
                             {tCopy.diagnosticsLabel}
                           </strong>
                         </div>
 
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
-                          <span className="text-[var(--muted)] block mb-1">Transport Security</span>
+                          <span className="text-[var(--muted)] block mb-1">Transport security</span>
                           <strong className="text-sm font-semibold">{tCopy.securityLabel}</strong>
                         </div>
 
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
-                          <span className="text-[var(--muted)] block mb-1">Transfer Auto-Accept</span>
+                          <span className="text-[var(--muted)] block mb-1">Auto-accept files</span>
                           <div className="flex items-center justify-between mt-1">
                             <span className="font-semibold">
-                              {p.autoAccept ? 'Enabled (Instant)' : 'Manual Prompt'}
+                              {p.autoAccept ? 'Enabled' : 'Ask before accepting'}
                             </span>
                             <button
                               type="button"
@@ -871,7 +881,7 @@ export default function LocalDrop(p: Props) {
                         </div>
 
                         <div className="p-4 rounded-2xl bg-[var(--paper)] border border-[var(--line)]">
-                          <span className="text-[var(--muted)] block mb-1">Peer Node</span>
+                          <span className="text-[var(--muted)] block mb-1">Paired device</span>
                           <strong className="text-sm font-semibold">{p.peer || 'None'}</strong>
                         </div>
                       </div>
@@ -888,7 +898,7 @@ export default function LocalDrop(p: Props) {
 
                     {/* Signature Packet Departure (Send) & Packet Assembly (Receive) for active transfers only */}
                     <AnimatePresence initial={false}>
-                      {activeTransfers.slice(0, 3).map((t) => (
+                      {activeTransfers.slice(0, 3).map((t, index) => (
                         <motion.div
                           key={t.id}
                           layout
@@ -907,7 +917,13 @@ export default function LocalDrop(p: Props) {
                                 progress: t.progress,
                                 status: 'active',
                                 speedLabel: t.status,
+                                awaitingApproval: t.awaitingApproval,
+                                paused: t.paused,
                               }}
+                              localIsPhone={isReceiverMobile}
+                              peerIsPhone={p.peerIsPhone}
+                              animatePackets={index === 0}
+                              onCancel={p.onCancel ? () => p.onCancel?.(t.id) : undefined}
                             >
                               {t.direction === 'receive' && (
                                 <ReceivedFileSave
