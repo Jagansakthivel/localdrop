@@ -16,7 +16,7 @@ export default defineConfig({
         cleanupOutdatedCaches: true,
         clientsClaim: true,
         skipWaiting: true,
-        navigateFallbackDenylist: [/^\/ws/, /^\/api/, /^\/health/, /^\/stats/],
+        navigateFallbackDenylist: [/^\/ws/, /^\/api/, /^\/health/, /^\/stats/, /^\/diagnostics\.html$/],
       },
       manifest: {
         name: 'LocalDrop',
@@ -41,6 +41,11 @@ export default defineConfig({
       },
     }),
   ],
+  build: {
+    rolldownOptions: {
+      input: { app: 'index.html', diagnostics: 'diagnostics.html' },
+    },
+  },
   server: {
     host: true,
     port: 5173,

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocalDrop network diagnostics</title>
+  <style>
+    body { max-width: 54rem; margin: 2rem auto; padding: 0 1rem; font: 1rem system-ui; color-scheme: light dark; }
+    label, textarea { display: block; margin: .6rem 0; }
+    textarea { width: 100%; box-sizing: border-box; }
+    button, select, input { margin: .25rem; font: inherit; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <h1>LocalDrop network diagnostics</h1>
+  <p>Use the same transport mode on both devices. Keep connection descriptions and room codes private.</p>
+  <label>Topology <select id="topology"><option value="single">One reliable channel</option><option value="striped">Production five-channel topology</option><option value="relay">Forced WebSocket relay</option></select></label>
+  <div id="rtc-settings">
+  <label>ICE servers <select id="ice"><option value="stun">Public STUN</option><option value="host">Host candidates only</option></select></label>
+  <label>Incoming signaling delay in ms <input id="signal-delay" type="number" min="0" max="15000" value="0"></label>
+  <button id="offer">Create offer</button>
+  <button id="answer">Apply offer and create answer</button>
+  <button id="apply">Apply answer</button>
+  <label for="remote">Offer or answer from the other device</label>
+  <textarea id="remote" rows="3" autocomplete="off" spellcheck="false"></textarea>
+  <label for="local">Local offer or answer</label>
+  <textarea id="local" rows="3" readonly></textarea>
+  </div>
+  <div id="relay-settings" hidden>
+    <label>Private room code <input id="room-code" type="text" inputmode="numeric" maxlength="4" autocomplete="off"></label>
+    <button id="host-relay">Create relay room</button>
+    <button id="join-relay">Join relay room</button>
+    <output id="relay-room" aria-live="polite"></output>
+    <p>Share the generated room code with the other device. Allow one incoming probe before each send. Relay rooms allow up to four sends per device.</p>
+  </div>
+  <h2>Transfer</h2>
+  <label>Receiver sink <select id="sink"><option value="discard">Hash and discard</option><option value="opfs">Hash and write to OPFS</option></select></label>
+  <label>Receiver delay per chunk in ms <input id="write-delay" type="number" min="0" max="200" value="0"></label>
+  <button id="arm" disabled>Allow one incoming probe</button>
+  <label>Test file (up to 128 MiB) <input id="file" type="file"></label>
+  <button id="send" disabled>Send probe</button>
+  <button id="reset">Cancel and disconnect</button>
+  <h2>Report</h2>
+  <button id="download" disabled>Download diagnostic report</button>
+  <pre id="report" aria-live="polite"></pre>
+  <script type="module" src="/src/diagnostics.ts"></script>
+</body>
+</html>

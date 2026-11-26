@@ -21,7 +21,7 @@ function isLocalDevHost(host: string): boolean {
  * Origin validation for browser security.
  * Enforces exact normalized origin allowlist (plus local dev/LAN origins).
  */
-function isOriginAllowed(originHeader: string | null, customOrigins?: string): boolean {
+function isOriginAllowed(originHeader: string | null, customOrigins?: string, strict = false): boolean {
   if (!originHeader) return true; // Non-browser clients, automated curl/pings, or same-origin
 
   try {
@@ -32,7 +32,7 @@ function isOriginAllowed(originHeader: string | null, customOrigins?: string): b
     const normalizedOrigin = originUrl.origin.toLowerCase();
     const host = originUrl.hostname.toLowerCase();
 
-    if (isLocalDevHost(host)) {
+    if (!strict && isLocalDevHost(host)) {
       return true;
     }
 
@@ -117,7 +117,7 @@ export default {
 
     // 2. Validate Origin for WebSocket and HTTP requests
     const origin = request.headers.get('Origin');
-    if (origin && !isOriginAllowed(origin, env.ALLOWED_ORIGINS)) {
+    if (origin && !isOriginAllowed(origin, env.ALLOWED_ORIGINS, env.STRICT_BROWSER_ORIGINS === '1')) {
       console.warn(`[LocalDrop Worker] Blocked unauthorized origin: ${origin}`);
       return new Response(JSON.stringify({ error: 'Unauthorized Origin', origin }), {
         status: 403,

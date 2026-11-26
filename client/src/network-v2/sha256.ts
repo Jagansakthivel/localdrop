@@ -15,9 +15,18 @@ export class Sha256 {
   private block(x: Uint8Array, off: number): void {
     const w=this.w; for(let i=0;i<16;i++){const j=off+i*4;w[i]=(x[j]<<24)|(x[j+1]<<16)|(x[j+2]<<8)|x[j+3];}
     for(let i=16;i<64;i++){const a=w[i-15],b=w[i-2];w[i]=(w[i-16]+(r(a,7)^r(a,18)^(a>>>3))+w[i-7]+(r(b,17)^r(b,19)^(b>>>10)))>>>0;}
-    let [a,b,c,d,e,f,g,h]=this.h;
+    const state = this.h;
+    let a = state[0], b = state[1], c = state[2], d = state[3];
+    let e = state[4], f = state[5], g = state[6], h = state[7];
     for(let i=0;i<64;i++){const t1=(h+(r(e,6)^r(e,11)^r(e,25))+((e&f)^(~e&g))+K[i]+w[i])>>>0; const t2=((r(a,2)^r(a,13)^r(a,22))+((a&b)^(a&c)^(b&c)))>>>0;h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;}
-    const v=[a,b,c,d,e,f,g,h];for(let i=0;i<8;i++)this.h[i]=(this.h[i]+v[i])>>>0;
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
   }
   digest(): string {
     if(this.sealed)throw new Error('Digest finalized');this.sealed=true;

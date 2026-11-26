@@ -1,3 +1,4 @@
+import type { Measure } from './transferTiming';
 import { CreditWindow } from './flow';
 import { sendPayload, type ResultMessage, type TransferPath } from './engine';
 import { checkAbort, readCredit, validateMeta, type FileMeta } from './wire';
@@ -12,6 +13,7 @@ export interface VerifiedOptions {
   subscribe:(control:(packet:SenderControl)=>void,credit:(frame:ArrayBuffer)=>void)=>()=>void;
   record:(bytes:number,waitMs:number)=>void;
   invalidatePath:(reason:unknown)=>void;
+  measure?:Measure;
   phase?:(phase: string)=>void;
 }
 function gate<T>(signal:AbortSignal,timeout:number){
@@ -28,10 +30,48 @@ export async function sendVerified(o:VerifiedOptions):Promise<ResultMessage>{
   const ready=gate<Ready>(signal,15000);let result:ReturnType<typeof progressGate<ResultMessage>>|undefined;let earlyResult:ResultMessage|undefined;let started=false;let confirmedBytes=0;
   let unsubscribe=()=>{};
   try{
-  unsubscribe=o.subscribe(msg=>{if(msg.transferId!==o.meta.transferId)return;if(msg.type==='v2-ready'){if(typeof msg.ok!=='boolean'){controller.abort(new Error('Invalid ready'));return;}ready.resolve(msg);}else if(msg.type==='v2-result'){if(typeof msg.ok!=='boolean'){controller.abort(new Error('Invalid result'));return;}if(result)result.resolve(msg);else earlyResult=msg;if(!msg.ok)controller.abort(new Error(msg.reason??'Receiver rejected transfer'));}},frame=>{try{if(!started)throw new Error('Unexpected credit before ready');const added=readCredit(frame);credit.add(added);if(added>0){confirmedBytes+=added;o.record(added,0);}if(result&&added>0)result.progress(added);}catch(e){controller.abort(e);}});
-    o.phase?.('meta-send');o.sendControl({type:'v2-meta',...o.meta});const accepted=await ready.promise;o.phase?.('receiver-ready');if(!accepted.ok)throw new Error(accepted.reason??'Receiver not ready');started=true;
-    o.phase?.('payload-start');const end=await sendPayload({meta:o.meta,file:o.file,path:o.path,signal,credit,record:o.record});checkAbort(signal);o.phase?.('payload-queued');
-    if(earlyResult)throw new Error('Premature completion acknowledgement');result=progressGate<ResultMessage>(signal,30000,600000);o.phase?.('end-send');o.sendControl({...end});const final=await result.promise;o.phase?.('result-received');
+    unsubscribe=o.subscribe(msg=>{
+      if(msg.transferId!==o.meta.transferId)return;
+      if(msg.type==='v2-ready'){
+        if(typeof msg.ok!=='boolean'){controller.abort(new Error('Invalid ready'));return;}
+        ready.resolve(msg);
+      }else if(msg.type==='v2-result'){
+        if(typeof msg.ok!=='boolean'){controller.abort(new Error('Invalid result'));return;}
+        if(result)result.resolve(msg);else earlyResult=msg;
+        if(!msg.ok)controller.abort(new Error(msg.reason??'Receiver rejected transfer'));
+      }
+    },frame=>{
+      try{
+        if(!started)throw new Error('Unexpected credit before ready');
+        const added=readCredit(frame);
+        credit.add(added);
+        const first=confirmedBytes===0;
+        confirmedBytes+=added;
+        o.record(added,0);
+        if(first)o.phase?.('first-credit');
+        if(confirmedBytes===o.meta.size)o.phase?.('all-credits');
+        result?.progress(added);
+      }catch(e){controller.abort(e);}
+    });
+    o.phase?.('meta-send');
+    const readyStart=performance.now();
+    o.sendControl({type:'v2-meta',...o.meta});
+    const accepted=await ready.promise.finally(()=>o.measure?.('receiver-ready',performance.now()-readyStart));
+    o.phase?.('receiver-ready');
+    if(!accepted.ok)throw new Error(accepted.reason??'Receiver not ready');
+    started=true;
+
+    o.phase?.('payload-start');
+    const end=await sendPayload({meta:o.meta,file:o.file,path:o.path,signal,credit,record:o.record,measure:o.measure});
+    checkAbort(signal);
+    o.phase?.('payload-queued');
+    if(earlyResult)throw new Error('Premature completion acknowledgement');
+    result=progressGate<ResultMessage>(signal,30000,600000);
+    o.phase?.('end-send');
+    const ackStart=performance.now();
+    o.sendControl({...end});
+    const final=await result.promise.finally(()=>o.measure?.('final-ack',performance.now()-ackStart));
+    o.phase?.('result-received');
     if(!final.ok||final.size!==o.file.size||final.digest!==end.digest||credit.outstanding!==0)throw new Error('Unverified receiver completion');if(o.file.size>confirmedBytes){o.record(o.file.size-confirmedBytes,0);confirmedBytes=o.file.size;}o.phase?.('verified');return final;
   }catch(e){try{o.sendControl({type:'v2-cancel',transferId:o.meta.transferId});}catch{/* transport already closed */}if(started)o.invalidatePath(e);throw e;}
   finally{controller.abort(new Error('Transfer scope closed'));scope.dispose();unsubscribe();}

@@ -2,6 +2,11 @@ export interface Bucket { tokens:number; at:number }
 export const RELAY_RATE=30*1024*1024;
 export const RELAY_BURST=4*1024*1024;
 export const CONTROL_RATE=40;
+// Full-rate payload produces about 60 credits/s at the current receiver threshold.
+export const RELAY_CREDIT_RATE=80;
+export function consumeRelayCredit(previous:Bucket|undefined,now=Date.now()){
+  return consume(previous,1,RELAY_CREDIT_RATE,RELAY_CREDIT_RATE,now);
+}
 export const MAX_RELAY_FRAME=256*1024;
 // Persist returned state with the existing serialized attachment, including rejected attempts.
 export function consume(previous:Bucket|undefined,amount:number,rate:number,burst:number,now=Date.now()):{allowed:boolean;state:Bucket}{

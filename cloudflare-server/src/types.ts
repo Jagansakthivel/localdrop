@@ -29,6 +29,7 @@ export interface ClientMeta {
   connectedAt: number;
   networkVersion?: number;
   controlBucket?: Bucket;
+  relayCreditBucket?: Bucket;
   binaryBucket?: Bucket;
   relayPending?: RelayPendingMeta;
   relayLedger?: ActiveRelayLedger;
@@ -99,6 +100,7 @@ export const SECURITY_LIMITS = {
 export interface Env {
   SIGNALING_HUB: DurableObjectNamespace;
   ALLOWED_ORIGINS?: string;
+  STRICT_BROWSER_ORIGINS?: string;
   TURN_ALLOWED_ORIGINS?: string;
   TURN_KEY_ID?: string;
   TURN_API_TOKEN?: string;

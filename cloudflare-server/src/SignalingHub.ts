@@ -16,6 +16,7 @@ import {
   chargeFrame,
   applyCredit,
   RELAY_RATE,
+  consumeRelayCredit,
   RELAY_BURST,
   CONTROL_RATE,
   MAX_RELAY_FRAME,
@@ -306,25 +307,18 @@ export class SignalingHub extends DurableObject<Env> {
 
         // 5-byte credit ACK from receiver -> opposite sender's ledger
         if (message.byteLength === 5) {
-          const ctrlCheck = consume(meta.controlBucket, 1, CONTROL_RATE, CONTROL_RATE);
-          meta.controlBucket = ctrlCheck.state;
-          if (!ctrlCheck.allowed) {
-            ws.serializeAttachment(meta);
-            this.abortRelayTransfer(ws, meta, 'Control credit rate exceeded');
+          const creditCheck = consumeRelayCredit(meta.relayCreditBucket);
+          const sender = paired.find((m) => m.meta.relayLedger?.targetId === meta.id);
+          if (!creditCheck.allowed) {
+            // A rejected attempt spends no tokens. Retaining the last accepted bucket
+            // computes the same refill without persisting each rejected frame.
+            if (sender) this.abortRelayTransfer(sender.ws, sender.meta, 'Relay credit rate exceeded');
             return;
           }
-
-          const members = this.getRoomSockets(meta.roomCode);
-          const sender = members.find((m) => m.meta.relayLedger?.targetId === meta.id);
-          if (!sender || !sender.meta.relayLedger) {
-            ws.serializeAttachment(meta);
-            this.sendJson(ws, {
-              type: 'error',
-              code: 'RELAY_CREDIT_ERROR',
-              message: 'No active relay ledger for credit',
-            });
-            return;
-          }
+          meta.relayCreditBucket = creditCheck.state;
+          ws.serializeAttachment(meta);
+          // Late credits after cancellation cannot be associated with a transfer.
+          if (!sender || !sender.meta.relayLedger) return;
 
           try {
             const updatedLedger = applyCredit(sender.meta.relayLedger, message);
@@ -333,10 +327,8 @@ export class SignalingHub extends DurableObject<Env> {
               ...updatedLedger,
             };
             sender.ws.serializeAttachment(sender.meta);
-            ws.serializeAttachment(meta);
             sender.ws.send(message);
           } catch (err) {
-            ws.serializeAttachment(meta);
             this.abortRelayTransfer(
               sender.ws,
               sender.meta,
@@ -379,8 +371,7 @@ export class SignalingHub extends DurableObject<Env> {
           return;
         }
 
-        const members = this.getRoomSockets(meta.roomCode);
-        const target = members.find((m) => m.meta.id === ledger.targetId);
+        const target = paired.find((m) => m.meta.id === ledger.targetId);
         if (!target) {
           ws.serializeAttachment(meta);
           this.abortRelayTransfer(ws, meta, 'Paired peer disconnected');
@@ -825,7 +816,12 @@ export class SignalingHub extends DurableObject<Env> {
               const admission = admitRelayMeta(
                 payload,
                 target?.meta.id,
-                Boolean(meta.relayLedger || meta.relayPending)
+                Boolean(
+                  meta.relayLedger || meta.relayPending ||
+                  (typeof payload.transferId === 'string' &&
+                    (target?.meta.relayLedger?.transferId === payload.transferId ||
+                      target?.meta.relayPending?.transferId === payload.transferId))
+                )
               );
               if (!admission.ok) {
                 this.sendJson(ws, {
@@ -1106,11 +1102,6 @@ export class SignalingHub extends DurableObject<Env> {
     const members = this.getRoomSockets(roomCode);
     for (const m of members) {
       if (m.meta.id !== fromId) {
-        if (m.meta.relayLedger?.transferId === transferId || m.meta.relayPending?.transferId === transferId) {
-          m.meta.relayLedger = undefined;
-          m.meta.relayPending = undefined;
-          m.ws.serializeAttachment(m.meta);
-        }
         this.sendJson(m.ws, {
           type: 'relay',
           from: fromId,

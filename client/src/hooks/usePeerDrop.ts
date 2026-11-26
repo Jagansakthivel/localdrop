@@ -37,7 +37,8 @@ import {
   startTransportRace,
 } from '../network-v2/transportRace';
 import { createPathAgreement, type CommittedPath } from '../network-v2/pathAgreement';
-import { createSpeedTrace, traceIce } from '../network-v2/speedTrace';
+import { transferTiming } from '../network-v2/transferTiming';
+import { createSpeedTrace, traceEnabled, traceIce } from '../network-v2/speedTrace';
 import { OfferReservations } from '../network-v2/offerReservations';
 import { createBatchAdmission } from '../network-v2/batchSafety';
 import { SessionLease } from '../network-v2/sessionLease';
@@ -280,24 +281,22 @@ export function usePeerDrop(wsUrl: string) {
           signalingConnected: wsConnectedRef.current,
           peerDiscovered: Boolean(targetPeerRef.current),
           connectionState: connectionStateRef.current,
-          transport,
           iceState: pcRef.current?.iceConnectionState ?? null,
           peerState: pcRef.current?.connectionState ?? null,
           channelState:
             agreementRef.current?.current === 'rtc'
               ? controlChannelRef.current?.readyState ?? null
               : dcRef.current?.readyState ?? null,
-          lastError,
           ...overrides,
         };
       });
     },
-    [transport, lastError]
+    []
   );
 
   useEffect(() => {
-    updateDiagnostics();
-  }, [updateDiagnostics]);
+    updateDiagnostics({ transport, lastError });
+  }, [connectionState, lastError, transport, updateDiagnostics, wsConnected]);
 
   const activeDiagnosticsRef = useRef(diagnostics);
   activeDiagnosticsRef.current = diagnostics;
@@ -711,6 +710,7 @@ export function usePeerDrop(wsUrl: string) {
         incomingReceiverIdRef.current = meta.transferId;
         const receiverStartedAt = performance.now();
         const receiveTrace = createSpeedTrace('receive');
+        const timing = traceEnabled() ? transferTiming() : undefined;
         receiveTrace('v2-meta');
         let firstChunkTraced = false;
         const genAtStart = sessionGenerationRef.current;
@@ -736,6 +736,7 @@ export function usePeerDrop(wsUrl: string) {
 
         void createFileSink(meta.name, meta.mime, meta.size)
           .then(async (sink) => {
+            timing?.measure('sink-init', performance.now() - receiverStartedAt);
             if (
               genAtStart !== sessionGenerationRef.current ||
               incomingReceiverIdRef.current !== meta.transferId ||
@@ -762,6 +763,7 @@ export function usePeerDrop(wsUrl: string) {
               meta,
               sink,
               signal: ac.signal,
+              measure: timing?.measure,
               sendCredit: (creditBuf) => {
                 if (committed === 'rtc') {
                   if (controlChannelRef.current?.readyState === 'open') {
@@ -780,7 +782,10 @@ export function usePeerDrop(wsUrl: string) {
               },
               result: (res: ResultMessage, file?: File) => {
                 sampler.stop(res.ok);
-                receiveTrace('ack-sent');
+                receiveTrace('result-ready', { ok: res.ok, bytes: res.size, path: committed });
+                if (timing) console.debug('[LocalDrop transfer stages]', {
+                  direction: 'receive', path: committed, ok: res.ok, bytes: res.size, stages: timing.snapshot(),
+                });
                 receiverSlotRef.current.release(slot);
                 if (incomingReceiverIdRef.current === meta.transferId) {
                   incomingReceiverRef.current = null;
@@ -1315,9 +1320,9 @@ export function usePeerDrop(wsUrl: string) {
               profilerRef.current?.mark('answer installed');
             }
           } catch (err) {
-            const msg = err instanceof Error ? err.message : 'SDP error';
-            networkLog('Error handling remote SDP signal:', err);
-            rtcTraceRef.current?.mark('sdp-error', { reason: msg });
+            const reason = err instanceof Error ? err.name : 'SDP error';
+            networkLog('Error handling remote SDP signal:', reason);
+            rtcTraceRef.current?.mark('sdp-error', { reason });
             if (isV2Active()) {
               raceRef.current?.check();
             } else {
@@ -2627,6 +2632,9 @@ export function usePeerDrop(wsUrl: string) {
           });
         });
         samplerRef.current = sampler;
+        const timing = traceEnabled() ? transferTiming() : undefined;
+        let confirmedBytes = 0;
+        let verified = false;
 
         try {
           if (committedPath === 'rtc' && (!pinnedControl || pinnedBulk.length !== 4)) {
@@ -2675,8 +2683,17 @@ export function usePeerDrop(wsUrl: string) {
                 senderSubsRef.current.delete(entry);
               };
             },
-            record: (bytes, waitMs) => sampler.record(bytes, waitMs),
-            phase: trace,
+            record: (bytes, waitMs) => {
+              confirmedBytes += bytes;
+              sampler.record(bytes, waitMs);
+            },
+            measure: timing?.measure,
+            phase: (phase) => {
+              trace(phase, committedPath === 'relay' ? {
+                queuedBytes: pinnedSocket?.bufferedAmount,
+                confirmedBytes,
+              } : { confirmedBytes });
+            },
             invalidatePath: () => {
               // Retire uncertain data path without silently switching mid-transfer
               if (committedPath === 'rtc') {
@@ -2685,6 +2702,7 @@ export function usePeerDrop(wsUrl: string) {
             },
           });
 
+          verified = true;
           sampler.stop(true);
           if (genAtStart === sessionGenerationRef.current) {
             setTotalSessionBytes((b) => b + file.size);
@@ -2718,6 +2736,9 @@ export function usePeerDrop(wsUrl: string) {
           setStatusText(errMsg);
           return false;
         } finally {
+          if (timing) console.debug('[LocalDrop transfer stages]', {
+            direction: 'send', path: committedPath, ok: verified, bytes: confirmedBytes, stages: timing.snapshot(),
+          });
           transferAc.abort();
           if (transferControllerRef.current === transferAc) {
             transferControllerRef.current = null;
