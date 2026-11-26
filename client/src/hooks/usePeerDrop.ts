@@ -1473,7 +1473,14 @@ export function usePeerDrop(wsUrl: string) {
         resilienceRef.current?.notify();
       },
 
-      onClose: () => {
+      onClose: (event) => {
+        const sock = socketManagerRef.current?.getSocket();
+        networkLog('Signaling socket closed', {
+          code: event.code,
+          reason: event.reason || 'none',
+          wasClean: event.wasClean,
+          bufferedAmount: sock?.bufferedAmount ?? 0,
+        });
         relayReadyRef.current = false;
         setWsConnected(false);
         agreementRef.current?.signalingLost();
@@ -1511,6 +1518,10 @@ export function usePeerDrop(wsUrl: string) {
         if (hasConnectedOnceRef.current) {
           setLastError('Signaling server connection error');
         }
+      },
+
+      onHeartbeatDiagnostic: (event, detail) => {
+        networkLog(`Heartbeat diagnostic: ${event}`, detail);
       },
 
       onReconnect: (attempt, delay) => {

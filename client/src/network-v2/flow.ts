@@ -39,11 +39,19 @@ export async function waitChannel(channel: RTCDataChannel, bytes: number, signal
   if (channel.readyState !== 'open') throw new Error('Data channel closed');
 }
 export async function waitSocket(socket: WebSocket, bytes: number, signal: AbortSignal): Promise<void> {
-  const deadline = performance.now() + 15000;
+  let bestBuffered = socket.bufferedAmount;
+  let lastProgress = performance.now();
   while (true) {
     checkAbort(signal); if (socket.readyState !== WebSocket.OPEN) throw new Error('Relay closed');
-    if (socket.bufferedAmount + bytes <= WINDOW) return;
-    if (performance.now() >= deadline) throw new Error('Relay buffer stalled');
+    const currentBuffered = socket.bufferedAmount;
+    if (currentBuffered + bytes <= WINDOW) return;
+    const now = performance.now();
+    if (currentBuffered < bestBuffered) {
+      bestBuffered = currentBuffered;
+      lastProgress = now;
+    } else if (now - lastProgress >= 15000) {
+      throw new Error('Relay buffer stalled');
+    }
     await new Promise<void>((resolve, reject) => {
       const abort = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); reject(signal.reason ?? new Error('Aborted')); };
       const timer = setTimeout(() => { signal.removeEventListener('abort', abort); resolve(); }, 15);

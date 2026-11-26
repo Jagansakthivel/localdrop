@@ -26,7 +26,7 @@ export async function sendPayload(o:SendOptions):Promise<EndMessage>{
     sha.update(bytes);const frame=encode(meta.fileId,index,index===count-1?EOF:DATA,bytes);
     if(channel){if(channel.readyState!=='open')throw new Error('Bulk channel closed');channel.send(frame);}
     else if(path.kind==='relay'){if(path.socket.readyState!==WebSocket.OPEN)throw new Error('Relay closed');path.socket.send(frame);}
-    record(size,waited);
+    record(0,waited);
   }
   return {type:'v2-end',transferId:meta.transferId,digest:sha.digest(),size:file.size};
 }
@@ -39,7 +39,7 @@ export function createReceiver(o:ReceiveOptions){
   let activeWrite:Promise<void>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;let creditTimer:ReturnType<typeof setTimeout>|undefined;
   const cleanup=()=>{clearTimeout(timer);clearTimeout(creditTimer);signal.removeEventListener('abort',onAbort);};
   function flushCredit(){clearTimeout(creditTimer);creditTimer=undefined;if(credit>0){const amt=credit;credit=0;try{sendCredit(creditFrame(amt));}catch(e){void fail(e);}}}
-  function armCreditTimer(){if(creditTimer===undefined&&credit>0){creditTimer=setTimeout(()=>flushCredit(),500);}}
+  function armCreditTimer(){if(creditTimer===undefined&&credit>0){creditTimer=setTimeout(()=>flushCredit(),250);}}
   function resetTimer(){clearTimeout(timer);timer=setTimeout(()=>void fail(new Error('Receiver transfer stalled')),30000);}
   async function fail(reason:unknown){if(done)return;done=true;cleanup();pending.clear();pendingBytes=0;await activeWrite?.catch(()=>{});await sink.abort().catch(()=>{});result({type:'v2-result',transferId:meta.transferId,ok:false,size:written,reason:reason instanceof Error?reason.message:'Transfer aborted'});}
   const onAbort=()=>void fail(signal.reason??new Error('Aborted'));
@@ -53,7 +53,7 @@ export function createReceiver(o:ReceiveOptions){
     }catch(e){await fail(e);}
   }
   async function drain(){if(writing||done)return;writing=true;
-    try{while(!done&&pending.has(next)){checkAbort(signal);const bytes=pending.get(next)!;activeWrite=sink.write(bytes);await activeWrite;activeWrite=undefined;if(done)return;sha.update(bytes);pending.delete(next);pendingBytes-=bytes.length;next++;written+=bytes.length;credit+=bytes.length;record(bytes.length);resetTimer();if(credit>=512*1024||written===meta.size){flushCredit();}else{armCreditTimer();}}}
+    try{while(!done&&pending.has(next)){checkAbort(signal);const bytes=pending.get(next)!;activeWrite=sink.write(bytes);await activeWrite;activeWrite=undefined;if(done)return;sha.update(bytes);pending.delete(next);pendingBytes-=bytes.length;next++;written+=bytes.length;credit+=bytes.length;record(bytes.length);resetTimer();if(credit>=256*1024||written===meta.size){flushCredit();}else{armCreditTimer();}}}
     catch(e){writing=false;await fail(e);return;}finally{writing=false;}
     await complete();
   }

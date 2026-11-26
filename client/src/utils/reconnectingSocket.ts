@@ -7,6 +7,7 @@ interface SocketHandlers {
   onError: (event: Event) => void;
   onReconnect?: (attempt: number, delay: number) => void;
   onExhausted?: () => void;
+  onHeartbeatDiagnostic?: (event: string, detail: Record<string, number | string>) => void;
 }
 
 export function createReconnectingSocket(url: string, handlers: SocketHandlers) {
@@ -50,14 +51,20 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
         if (stopped || myGeneration !== generation || socket !== current) return;
         attempts = 0;
         stopHeartbeat?.();
-        stopHeartbeat = attachHeartbeat(current, () => {
-          if (stopped || myGeneration !== generation || socket !== current) return;
-          try {
-            current.close(4000, 'Heartbeat timeout');
-          } catch {
-            // ignore
+        stopHeartbeat = attachHeartbeat(
+          current,
+          () => {
+            if (stopped || myGeneration !== generation || socket !== current) return;
+            try {
+              current.close(4000, 'Heartbeat timeout');
+            } catch {
+              // ignore
+            }
+          },
+          {
+            onDiagnostic: handlers.onHeartbeatDiagnostic,
           }
-        });
+        );
         handlers.onOpen(current);
       };
 
@@ -139,6 +146,8 @@ export function createReconnectingSocket(url: string, handlers: SocketHandlers) 
     close() {
       stopped = true;
       generation++;
+      stopHeartbeat?.();
+      stopHeartbeat = null;
       if (typeof window !== 'undefined') {
         window.removeEventListener('online', wake);
         window.removeEventListener('pageshow', wake);

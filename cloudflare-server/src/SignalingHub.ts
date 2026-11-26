@@ -289,6 +289,12 @@ export class SignalingHub extends DurableObject<Env> {
       const paired = this.getRoomSockets(meta.roomCode).filter((m) => m.meta.id !== meta.id);
       const wireVersion = roomWireVersion(meta.networkVersion, paired.map((p) => p.meta.networkVersion));
       if (wireVersion === null) {
+        console.warn('[SignalingHub] Relay rejected: invalid peer count', {
+          peerCount: paired.length,
+          bytes: message.byteLength,
+          hasLedger: Boolean(meta.relayLedger),
+          hasPending: Boolean(meta.relayPending),
+        });
         this.abortRelayTransfer(ws, meta, 'Relay requires exactly one paired peer');
         return;
       }
@@ -1010,6 +1016,11 @@ export class SignalingHub extends DurableObject<Env> {
         }
         await this.markCredentialGrace(participantId);
         const remaining = this.getRoomSockets(oldRoom);
+        console.info('[SignalingHub] Socket terminated', {
+          code,
+          remainingPeers: remaining.length,
+          hadActiveTransfer: Boolean(activeTransferId),
+        });
         for (const m of remaining) {
           this.sendJson(m.ws, {
             type: 'peer-reconnecting',
