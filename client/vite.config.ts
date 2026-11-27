@@ -4,7 +4,13 @@ import tailwindcss from '@tailwindcss/vite';
 import basicSsl from '@vitejs/plugin-basic-ssl';
 import { VitePWA } from 'vite-plugin-pwa';
 
+// The deployed staging Worker builds this entry explicitly. Vercel production
+// must omit it even if a preview-only setting is inherited by the build.
+const diagnostics = process.env.LOCALDROP_BUILD_DIAGNOSTICS === '1' &&
+  process.env.VERCEL_ENV !== 'production';
+
 export default defineConfig({
+  define: diagnostics ? {} : { 'import.meta.env.VITE_ENABLE_TURN': JSON.stringify('false') },
   plugins: [
     react(),
     tailwindcss(),
@@ -16,7 +22,7 @@ export default defineConfig({
         cleanupOutdatedCaches: true,
         clientsClaim: true,
         skipWaiting: true,
-        navigateFallbackDenylist: [/^\/ws/, /^\/api/, /^\/health/, /^\/stats/, /^\/diagnostics\.html$/],
+        navigateFallbackDenylist: [/^\/ws/, /^\/api/, /^\/health/, /^\/stats/, /^\/diagnostics(?:\.html)?(?:[/?]|$)/],
       },
       manifest: {
         name: 'LocalDrop',
@@ -43,7 +49,7 @@ export default defineConfig({
   ],
   build: {
     rolldownOptions: {
-      input: { app: 'index.html', diagnostics: 'diagnostics.html' },
+      input: diagnostics ? { app: 'index.html', diagnostics: 'diagnostics.html' } : { app: 'index.html' },
     },
   },
   server: {
