@@ -17,7 +17,8 @@
   <p>Use the same transport mode on both devices. Keep connection descriptions and room codes private.</p>
   <label>Topology <select id="topology"><option value="single">One reliable channel</option><option value="striped">Production five-channel topology</option><option value="relay">Forced WebSocket relay</option></select></label>
   <div id="rtc-settings">
-  <label>ICE servers <select id="ice"><option value="stun">Public STUN</option><option value="host">Host candidates only</option></select></label>
+  <label>ICE servers <select id="ice"><option value="stun">Public STUN</option><option value="host">Host candidates only</option><option value="turn">STUN and authenticated TURN</option><option value="forced-turn">Forced TURN relay</option></select></label>
+  <label>TURN server connection <select id="turn-protocol"><option value="any">Allow all</option><option value="udp">UDP only</option><option value="tcp">TCP only</option><option value="tls">TLS only</option></select></label>
   <label>Incoming signaling delay in ms <input id="signal-delay" type="number" min="0" max="15000" value="0"></label>
   <button id="offer">Create offer</button>
   <button id="answer">Apply offer and create answer</button>
@@ -31,6 +32,7 @@
     <label>Private room code <input id="room-code" type="text" inputmode="numeric" maxlength="4" autocomplete="off"></label>
     <button id="host-relay">Create relay room</button>
     <button id="join-relay">Join relay room</button>
+    <label>WebSocket frame size <select id="relay-frame"><option value="256">256 KiB</option><option value="128">128 KiB</option><option value="64">64 KiB</option><option value="16">16 KiB</option></select></label>
     <output id="relay-room" aria-live="polite"></output>
     <p>Share the generated room code with the other device. Allow one incoming probe before each send. Relay rooms allow up to four sends per device.</p>
   </div>

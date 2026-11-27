@@ -28,6 +28,7 @@ export default function App() {
   const {
     wsConnected,
     connectionState,
+    diagnostics,
     transport,
     connectedPeer,
     localDeviceName,
@@ -44,6 +45,7 @@ export default function App() {
     sendTextOrLink,
     sendFile,
     acceptIncomingFile,
+    canSaveIncomingDirectly,
     declineIncomingFile,
     cancelTransfer,
   } = usePeerDrop(WS_CONFIG.url);
@@ -296,7 +298,10 @@ export default function App() {
             ? matchingFile
               ? 'Verified ✓'
               : 'Finalizing…'
-            : `${(telemetry.speedMbps).toFixed(1)} MB/s · ${telemetry.etaSeconds}s remaining`,
+            : telemetry.transferPhase === 'verifying' ? 'Verifying and finalizing…'
+            : telemetry.transferPhase === 'waiting' ? 'Waiting for transfer progress…'
+            : telemetry.speedMbps > 0 ? `${telemetry.speedMbps.toFixed(2)} MiB/s · ${telemetry.etaSeconds}s remaining`
+            : 'Measuring transfer speed…',
         file: matchingFile || null,
       });
     }
@@ -383,12 +388,14 @@ export default function App() {
         error={displayError}
         connectionState={connectionState}
         transport={transport}
+        pathKind={diagnostics.pathKind}
         wsConnected={wsConnected}
         autoAccept={autoAccept}
         onToggleAutoAccept={() => setAutoAccept(!autoAccept)}
         telemetry={telemetry}
         incomingOffer={incomingOffer}
         onAcceptOffer={acceptIncomingFile}
+        canSaveIncomingDirectly={canSaveIncomingDirectly}
         onDeclineOffer={declineIncomingFile}
         sharedItems={sharedItems}
         onBatchZip={handleBatchZip}

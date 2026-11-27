@@ -24,6 +24,10 @@ async function connect(left, right, topology) {
     if (topology !== 'relay') await page.locator('#ice').selectOption('host');
   }));
   if (topology === 'relay') {
+    if (topology === 'relay' && process.env.LOCALDROP_RELAY_FRAME_KIB) {
+      for (const page of [left, right]) await page.locator('#relay-frame').selectOption(process.env.LOCALDROP_RELAY_FRAME_KIB);
+    }
+
     await left.getByRole('button', { name: 'Create relay room' }).click();
     const code = await left.waitForFunction(() => document.querySelector('#relay-room').textContent.match(/Room (\d{4})/)?.[1]);
     await right.locator('#room-code').fill(await code.jsonValue());
@@ -45,13 +49,13 @@ async function connect(left, right, topology) {
 }
 
 async function reports(page, event) {
-  return (await page.locator('#report').textContent()).split('\n')
+  return (await page.locator('#report').textContent()).split('\n').filter(Boolean)
     .map((line) => JSON.parse(line)).filter((entry) => entry.event === event);
 }
 
 async function waitResult(page, event, previous) {
   await page.waitForFunction(({ event, previous }) => document.querySelector('#report').textContent
-    .split('\n').filter((line) => JSON.parse(line).event === event).length > previous,
+    .split('\n').filter(Boolean).filter((line) => JSON.parse(line).event === event).length > previous,
   { event, previous }, { timeout: 45000 });
   return (await reports(page, event)).at(-1);
 }
@@ -123,7 +127,7 @@ try {
     }
     const forward = await transfer(left, right, small.buffer.length, small, 'discard');
     const smoke = process.env.LOCALDROP_DIAGNOSTICS_SMOKE === '1';
-    const delayed = smoke ? null : await transfer(left, right, 100000000, large, 'opfs', 2);
+    const delayed = smoke ? null : await transfer(left, right, 100000000, large, 'opfs', Number(process.env.LOCALDROP_WRITE_DELAY_MS ?? 2));
     const reverse = await transfer(right, left, small.buffer.length, small, 'discard');
     const downloadEvent = left.waitForEvent('download');
     await left.getByRole('button', { name: 'Download diagnostic report' }).click();
@@ -144,7 +148,7 @@ try {
     await left.locator('#file').setInputFiles(large);
     await left.locator('#send').click();
     await right.waitForFunction((count) => document.querySelector('#report').textContent
-      .split('\n').filter((line) => JSON.parse(line).event === 'first-chunk-written').length > count, writes);
+      .split('\n').filter(Boolean).filter((line) => JSON.parse(line).event === 'first-chunk-written').length > count, writes);
     await left.locator('#reset').click();
     const cancelled = await waitResult(left, 'send-result', previous);
     assert.equal(cancelled.ok, false);
@@ -159,6 +163,19 @@ try {
       assert.equal(await right.locator('#arm').isDisabled(), true);
     }
   }
+  if (process.env.LOCALDROP_TEST_TURN_UNAVAILABLE === '1') {
+    await left.goto(pageUrl);
+    await left.locator('#ice').selectOption('forced-turn');
+    await left.locator('#turn-protocol').selectOption('tls');
+    await left.getByRole('button', { name: 'Create offer', exact: true }).click();
+    const turn = await waitResult(left, 'turn-credentials', 0);
+    assert.equal(turn.status, 'turn-not-configured');
+    assert.equal(turn.protocol, 'tls');
+    await waitResult(left, 'action-failed', 0);
+    assert.equal(await left.locator('#local').inputValue(), '');
+    assert.equal(await left.locator('#send').isDisabled(), true);
+  }
+
 } finally {
   await Promise.all(browsers.map((browser) => browser.close()));
   await rm(temp, { recursive: true, force: true });

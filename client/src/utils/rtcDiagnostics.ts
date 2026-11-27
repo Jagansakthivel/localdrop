@@ -18,6 +18,7 @@ export interface SanitizedPeerStats {
     localType: string | null;
     remoteType: string | null;
     protocol: string | null;
+    relayProtocol: string | null;
     currentRoundTripTime: number | null;
     availableOutgoingBitrate: number | null;
     bytesSent: number | null;
@@ -109,12 +110,14 @@ export async function inspectPeerStats(pc: RTCPeerConnection): Promise<Sanitized
     });
 
     if (!selectedPairId) {
-      stats.forEach((raw) => {
-        const r = raw as unknown as Record<string, unknown>;
-        if (r.type === 'candidate-pair' && (r.selected === true || r.nominated === true)) {
-          if (typeof r.id === 'string') selectedPairId = r.id;
-        }
+      const nominated: string[] = [];
+      stats.forEach((entry) => {
+        const pair = entry as unknown as Record<string, unknown>;
+        if (pair.type !== 'candidate-pair' || typeof pair.id !== 'string') return;
+        if (pair.selected === true) selectedPairId = pair.id;
+        if (pair.nominated === true && pair.state === 'succeeded') nominated.push(pair.id);
       });
+      if (!selectedPairId && nominated.length === 1) selectedPairId = nominated[0];
     }
 
     if (selectedPairId) {
@@ -134,6 +137,7 @@ export async function inspectPeerStats(pc: RTCPeerConnection): Promise<Sanitized
           localType: typeof local?.candidateType === 'string' ? local.candidateType : null,
           remoteType: typeof remote?.candidateType === 'string' ? remote.candidateType : null,
           protocol: typeof local?.protocol === 'string' ? local.protocol : null,
+          relayProtocol: typeof local?.relayProtocol === 'string' ? local.relayProtocol : null,
           currentRoundTripTime:
             typeof pair.currentRoundTripTime === 'number' ? pair.currentRoundTripTime : null,
           availableOutgoingBitrate:

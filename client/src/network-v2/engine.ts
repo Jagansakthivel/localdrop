@@ -40,18 +40,30 @@ export async function sendPayload(o:SendOptions):Promise<EndMessage>{
   }
   return {type:'v2-end',transferId:meta.transferId,digest:sha.digest(),size:file.size};
 }
-export interface ReceiveOptions { meta:FileMeta; sink:FileSink; signal:AbortSignal; sendCredit:(frame:ArrayBuffer)=>void; record:(bytes:number)=>void; result:(r:ResultMessage,file?:File)=>void; measure?:Measure }
+export interface ReceiveOptions { meta:FileMeta; sink:FileSink; signal:AbortSignal; sendCredit:(frame:ArrayBuffer)=>void; record:(bytes:number)=>void; result:(r:ResultMessage,file?:File)=>void; measure?:Measure; creditBatchBytes?:number }
 // One accepted transfer per direction. Credit bounds all four channels together.
 // No acknowledgement of completion until the sink is committed AND the digest matches.
 export function createReceiver(o:ReceiveOptions){
-  const {meta,sink,signal,sendCredit,record,result,measure}=o;const count=validateMeta(meta);const sha=new Sha256();
+  const {meta,sink,signal,sendCredit,record,result,measure,creditBatchBytes=256*1024}=o;const count=validateMeta(meta);const sha=new Sha256();
   const pending=new Map<number,Uint8Array>();let pendingBytes=0,next=0,written=0,credit=0,done=false,writing=false,finishing=false,terminal:EndMessage|undefined;
   let activeWrite:Promise<void>|undefined;let timer:ReturnType<typeof setTimeout>|undefined;let creditTimer:ReturnType<typeof setTimeout>|undefined;
   const cleanup=()=>{clearTimeout(timer);clearTimeout(creditTimer);signal.removeEventListener('abort',onAbort);};
   function flushCredit(){clearTimeout(creditTimer);creditTimer=undefined;if(credit>0){const amt=credit;credit=0;try{sendCredit(creditFrame(amt));}catch(e){void fail(e);}}}
   function armCreditTimer(){if(creditTimer===undefined&&credit>0){creditTimer=setTimeout(()=>flushCredit(),250);}}
   function resetTimer(){clearTimeout(timer);timer=setTimeout(()=>void fail(new Error('Receiver transfer stalled')),30000);}
-  async function fail(reason:unknown){if(done)return;done=true;cleanup();pending.clear();pendingBytes=0;await activeWrite?.catch(()=>{});await sink.abort().catch(()=>{});result({type:'v2-result',transferId:meta.transferId,ok:false,size:written,reason:reason instanceof Error?reason.message:'Transfer aborted'});}
+  async function fail(reason: unknown) {
+    if (done) return;
+    done = true;
+    cleanup();
+    pending.clear();
+    pendingBytes = 0;
+    await activeWrite?.catch(() => {});
+    await sink.abort().catch(() => {});
+    const message = reason instanceof DOMException && reason.name === 'QuotaExceededError'
+      ? 'Receiver storage quota exceeded'
+      : reason instanceof Error ? reason.message : 'Transfer aborted';
+    result({ type: 'v2-result', transferId: meta.transferId, ok: false, size: written, reason: message });
+  }
   const onAbort=()=>void fail(signal.reason??new Error('Aborted'));
   async function complete(){
     if(done||writing||finishing||!terminal||next!==count)return;
@@ -63,7 +75,7 @@ export function createReceiver(o:ReceiveOptions){
     }catch(e){await fail(e);}
   }
   async function drain(){if(writing||done)return;writing=true;
-    try{while(!done&&pending.has(next)){checkAbort(signal);const bytes=pending.get(next)!;const writeStart=performance.now();activeWrite=sink.write(bytes);await activeWrite;activeWrite=undefined;measure?.('sink-write',performance.now()-writeStart);if(done)return;const hashStart=performance.now();sha.update(bytes);measure?.('receive-hash',performance.now()-hashStart);pending.delete(next);pendingBytes-=bytes.length;next++;written+=bytes.length;credit+=bytes.length;record(bytes.length);resetTimer();if(credit>=256*1024||written===meta.size){flushCredit();}else{armCreditTimer();}}}
+    try{while(!done&&pending.has(next)){checkAbort(signal);const bytes=pending.get(next)!;const writeStart=performance.now();activeWrite=sink.write(bytes);await activeWrite;activeWrite=undefined;measure?.('sink-write',performance.now()-writeStart);if(done)return;const hashStart=performance.now();sha.update(bytes);measure?.('receive-hash',performance.now()-hashStart);pending.delete(next);pendingBytes-=bytes.length;next++;written+=bytes.length;credit+=bytes.length;record(bytes.length);resetTimer();if(credit>=creditBatchBytes||written===meta.size){flushCredit();}else{armCreditTimer();}}}
     catch(e){writing=false;await fail(e);return;}finally{writing=false;}
     await complete();
   }

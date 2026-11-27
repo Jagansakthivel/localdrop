@@ -1,3 +1,4 @@
+import { chooseSaveLocation, supportsNativeSavePicker } from '../utils/saveReceivedFile';
 import {
   ackMatches,
   isRelayError,
@@ -70,6 +71,7 @@ export interface TransferTelemetry {
   totalBytes: number;
   transferredBytes: number;
   speedMbps: number;
+  transferPhase?: 'transferring' | 'waiting' | 'verifying' | 'complete';
   etaSeconds: number;
   progress: number;
   awaitingApproval?: boolean;
@@ -88,7 +90,9 @@ export interface IncomingFileOffer {
 const CHUNK_SIZE = 64 * 1024;
 const NEGOTIATION_TIMEOUT_MS = 8000;
 const PAIRING_TIMEOUT_MS = 15000;
-const OFFER_APPROVAL_TIMEOUT_MS = 30000;
+const OFFER_APPROVAL_TIMEOUT_MS = 60000;
+const TURN_ENABLED = import.meta.env.VITE_ENABLE_TURN === 'true';
+const LARGE_FILE_BYTES = 128 * 1024 * 1024;
 const ACK_TIMEOUT_MS = 10000;
 
 function detectBrowserName(): string {
@@ -203,7 +207,7 @@ export function usePeerDrop(wsUrl: string) {
   const raceRef = useRef<ReturnType<typeof startTransportRace> | null>(null);
   const nextFileIdRef = useRef<number>(0);
   const approvedOffersRef = useRef<
-    Map<string, { name: string; size: number; mime: string; at: number }>
+    Map<string, { name: string; size: number; mime: string; at: number; handle?: FileSystemFileHandle }>
   >(new Map());
   const incomingOfferRef = useRef<boolean>(false);
   const earlySignalsRef = useRef<
@@ -235,7 +239,6 @@ export function usePeerDrop(wsUrl: string) {
   >(new Set());
   const samplerRef = useRef<ReturnType<typeof createSampler> | null>(null);
   const pairingStartMsRef = useRef<number>(0);
-  const turnFetchPromiseRef = useRef<Promise<void> | null>(null);
   const turnExpiresAtRef = useRef<number | null>(null);
   const relayPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const offerResRef = useRef(new OfferReservations());
@@ -571,7 +574,7 @@ export function usePeerDrop(wsUrl: string) {
         const mime = typeof msg.mime === 'string' ? msg.mime.slice(0, 128) : 'application/octet-stream';
         if (!offerId || !name || !Number.isSafeInteger(size) || size < 0) return;
 
-        if (autoAcceptRef.current) {
+        if (autoAcceptRef.current && !(transferId && isV2Active() && size > LARGE_FILE_BYTES && supportsNativeSavePicker())) {
           if (transferId) {
             const gen = sessionGenerationRef.current;
             const reserved = offerResRef.current.reserve({
@@ -582,7 +585,7 @@ export function usePeerDrop(wsUrl: string) {
               size,
               mime,
               deadline: performance.now() + 65_000,
-              accepted: autoAcceptRef.current,
+              accepted: true,
             });
             if (!reserved) {
               sendJsonPacket({
@@ -725,6 +728,7 @@ export function usePeerDrop(wsUrl: string) {
             fileMime: meta.mime,
             totalBytes: meta.size,
             transferredBytes: s.bytes,
+            transferPhase: s.phase,
             speedMbps: Number((s.speedBps / (1024 * 1024)).toFixed(2)),
             etaSeconds: Number.isFinite(s.etaSeconds) ? s.etaSeconds : 0,
             progress: s.progress,
@@ -734,7 +738,7 @@ export function usePeerDrop(wsUrl: string) {
         setStatusText(`Receiving ${meta.name}...`);
         setTransferProgress(1);
 
-        void createFileSink(meta.name, meta.mime, meta.size)
+        void createFileSink(meta.name, meta.mime, meta.size, approved.handle)
           .then(async (sink) => {
             timing?.measure('sink-init', performance.now() - receiverStartedAt);
             if (
@@ -814,7 +818,11 @@ export function usePeerDrop(wsUrl: string) {
                 } else {
                   opfsSinksRef.current.delete(meta.transferId);
                   setTransferProgress(0);
-                  setStatusText(res.reason || 'Transfer failed');
+                  if (genAtStart === sessionGenerationRef.current) {
+                    const reason = res.reason || 'Transfer failed';
+                    setLastError(reason);
+                    setStatusText(reason);
+                  }
                 }
                 const tid = meta.transferId;
                 setTimeout(() => setTelemetry((prev) => clearMatchingTransfer(prev, tid)), 1200);
@@ -864,21 +872,22 @@ export function usePeerDrop(wsUrl: string) {
         }
       } else if (msg.type === 'v2-cancel') {
         const tid = typeof msg.transferId === 'string' ? msg.transferId : '';
-        const reasonText = String(msg.reason || 'Peer cancelled');
-        if (tid) {
-          approvedOffersRef.current.delete(tid);
-          receiverSlotRef.current.cancel(tid, new Error(reasonText));
-        }
-        if (tid && tid === incomingReceiverIdRef.current) {
-          if (incomingReceiverRef.current) {
-            void incomingReceiverRef.current.abort(new Error(reasonText));
+        if (!tid) return;
+        const incoming = tid === incomingReceiverIdRef.current || tid === receiverSlotRef.current.current?.id;
+        const outgoing = tid === activeOutgoingIdRef.current;
+        const approved = approvedOffersRef.current.delete(tid);
+        if (!incoming && !outgoing && !approved) return;
+        const reasonText = typeof msg.reason === 'string' && msg.reason ? msg.reason : 'Peer cancelled';
+        const reason = new Error(reasonText);
+        if (incoming) {
+          receiverSlotRef.current.cancel(tid, reason);
+          if (tid === incomingReceiverIdRef.current) {
+            void incomingReceiverRef.current?.abort(reason);
             incomingReceiverRef.current = null;
+            incomingReceiverIdRef.current = null;
           }
-          incomingReceiverIdRef.current = null;
         }
-        if (tid && tid === activeOutgoingIdRef.current && transferControllerRef.current) {
-          transferControllerRef.current.abort(new Error(reasonText));
-        }
+        if (outgoing) transferControllerRef.current?.abort(reason);
         setTransferProgress(0);
         setTelemetry(null);
         setLastError(reasonText);
@@ -1202,6 +1211,19 @@ export function usePeerDrop(wsUrl: string) {
   );
 
   // Create an RTCPeerConnection instance with state listeners
+  const reportSelectedRtcPath = useCallback((pc: RTCPeerConnection) => {
+    void selectedPath(pc).then((path) => {
+      if (pcRef.current !== pc || pc.signalingState === 'closed' ||
+          agreementRef.current?.current !== 'rtc') return;
+      updateDiagnostics({
+        pathKind: path.kind,
+        localCandidateType: path.localType,
+        remoteCandidateType: path.remoteType,
+        candidateProtocol: path.protocol,
+      });
+    });
+  }, [updateDiagnostics]);
+
   const createPeerConnection = useCallback(
     (peer: PeerInfo, preserveAgreement = false) => {
       if (preserveAgreement) {
@@ -1218,7 +1240,10 @@ export function usePeerDrop(wsUrl: string) {
       });
       const unsubDiag = attachRtcDiagnostics(pc, rtcTraceRef.current ?? undefined);
       const unsubTrace = traceIce(pc);
+      let watchedIce: RTCIceTransport | undefined;
+      const reportPair = () => reportSelectedRtcPath(pc);
       rtcCleanupRef.current = () => {
+        watchedIce?.removeEventListener('selectedcandidatepairchange', reportPair);
         unsubDiag();
         unsubTrace();
       };
@@ -1259,6 +1284,13 @@ export function usePeerDrop(wsUrl: string) {
         resilienceRef.current?.notify();
         raceRef.current?.check();
         if (pc.connectionState === 'connected') {
+          const iceTransport = pc.sctp?.transport?.iceTransport;
+          if (iceTransport && iceTransport !== watchedIce) {
+            watchedIce?.removeEventListener('selectedcandidatepairchange', reportPair);
+            watchedIce = iceTransport;
+            watchedIce.addEventListener('selectedcandidatepairchange', reportPair);
+          }
+          reportPair();
           profilerRef.current?.mark('ICE connected');
         } else if (pc.connectionState === 'failed' && !isV2Active()) {
           networkLog('PeerConnection failed, attempting relay');
@@ -1268,7 +1300,7 @@ export function usePeerDrop(wsUrl: string) {
 
       return pc;
     },
-    [teardownPeerConnection, closeRtcResources, sendSignal, setupDataChannel, attachV2Channel, fallbackToRelay, isV2Active]
+    [teardownPeerConnection, closeRtcResources, sendSignal, setupDataChannel, attachV2Channel, fallbackToRelay, isV2Active, reportSelectedRtcPath]
   );
 
   const enqueueSignal = useCallback(
@@ -1305,8 +1337,9 @@ export function usePeerDrop(wsUrl: string) {
             }
             if (!valid()) return;
             rtcTraceRef.current?.mark('remote-desc-set', { type: signal.sdp.type ?? 'unknown' });
-            await iceQueueRef.current.flush(pc);
+            const queued = await iceQueueRef.current.flush(pc);
             if (!valid()) return;
+            rtcTraceRef.current?.mark('ice-candidates-flushed', queued);
 
             if (signal.sdp.type === 'offer') {
               const answer = await pc.createAnswer();
@@ -1333,8 +1366,8 @@ export function usePeerDrop(wsUrl: string) {
           rtcTraceRef.current?.mark('ice-candidate-remote', {
             type: extractCandidateType(signal.candidate.candidate || ''),
           });
-          await iceQueueRef.current.add(pc, signal.candidate);
-          rtcTraceRef.current?.mark('ice-candidate-applied');
+          const outcome = await iceQueueRef.current.add(pc, signal.candidate);
+          if (valid()) rtcTraceRef.current?.mark(`ice-candidate-${outcome}`);
         }
       });
     },
@@ -1357,17 +1390,6 @@ export function usePeerDrop(wsUrl: string) {
       }
 
       negotiatingPeerIdRef.current = peer.id;
-      const genBeforeTurn = sessionGenerationRef.current;
-      if (turnFetchPromiseRef.current) {
-        await Promise.race([
-          turnFetchPromiseRef.current,
-          new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-        ]);
-      }
-      if (genBeforeTurn !== sessionGenerationRef.current) {
-        return;
-      }
-
       const v2 = isV2Active();
       const pc = createPeerConnection(peer, false);
       // Set negotiating identity AFTER teardown inside createPeerConnection
@@ -1417,22 +1439,10 @@ export function usePeerDrop(wsUrl: string) {
           onCommit: (path) => {
             if (genAtStart !== sessionGenerationRef.current) return;
             rtcTraceRef.current?.mark('path-committed', { path });
+            updateDiagnostics({ pathKind: path === 'rtc' ? 'webrtc-unknown' : 'ws-relay',
+              localCandidateType: undefined, remoteCandidateType: undefined, candidateProtocol: undefined });
             markConnected(path === 'rtc' ? 'direct' : 'relayed', peer);
-            if (path === 'rtc' && pcRef.current) {
-              const committedPc = pcRef.current;
-              void selectedPath(committedPc).then((sp) => {
-                if (genAtStart === sessionGenerationRef.current && agreementRef.current?.current === 'rtc') {
-                  updateDiagnostics({
-                    pathKind: sp.kind,
-                    localCandidateType: sp.localType,
-                    remoteCandidateType: sp.remoteType,
-                    candidateProtocol: sp.protocol,
-                  });
-                }
-              });
-            } else if (path === 'relay') {
-              updateDiagnostics({ pathKind: 'ws-relay' });
-            }
+            if (path === 'rtc' && pcRef.current) reportSelectedRtcPath(pcRef.current);
           },
           invalidate: (err) => {
             networkLog('Path agreement invalidated:', err.message);
@@ -1605,40 +1615,51 @@ export function usePeerDrop(wsUrl: string) {
     // Send asynchronous HTTP health check to wake up sleeping free-tier backends (Render cold start)
     void pingBackendHealth(8000);
 
+    let turnRetryAt = 0;
+    let turnRequest: { token: string; controller: AbortController } | undefined;
     const refreshTurnIceServers = (roomCode: string, token: string) => {
-      if (!turnNeedsRefresh(turnExpiresAtRef.current)) return;
-      const ac = new AbortController();
-      const promise = fetchIceServersWithExpiry(wsUrl, token, roomCode, ac.signal)
+      if (!TURN_ENABLED || !turnNeedsRefresh(turnExpiresAtRef.current) || turnRequest?.token === token) return;
+      turnRequest?.controller.abort();
+      const controller = new AbortController();
+      const request = { token, controller };
+      turnRequest = request;
+      const started = performance.now();
+      const gen = sessionGenerationRef.current;
+      void fetchIceServersWithExpiry(wsUrl, token, roomCode, controller.signal)
         .then((res) => {
-          if (mountGen === sessionGenerationRef.current && res.iceServers.length > 0) {
-            rtcTraceRef.current?.mark('turn-done', {
-              status: res.status,
-              iceServersCount: res.iceServers.length,
-            });
-            iceServersRef.current = res.iceServers;
-            if (res.expiresAt !== null) {
-              turnExpiresAtRef.current = res.expiresAt;
-            }
-            if (
-              pcRef.current &&
-              pcRef.current.signalingState !== 'closed' &&
-              !isTransferActiveRef.current
-            ) {
-              try {
-                pcRef.current.setConfiguration(rtcConfiguration(res.iceServers));
-              } catch {
-                // ignore if browser disallows setConfiguration in current state
-              }
-            }
+          if (gen !== sessionGenerationRef.current || resumeTokenRef.current !== token ||
+              activeRoomRef.current !== roomCode || controller.signal.aborted) return;
+          rtcTraceRef.current?.mark('turn-done', {
+            status: res.status,
+            elapsedMs: Math.round(performance.now() - started),
+            iceServersCount: res.iceServers.length,
+          });
+          // A failed refresh must not replace credentials that are still usable.
+          turnRetryAt = res.expiresAt === null ? Date.now() + 10 * 60_000 : 0;
+          if (res.expiresAt === null && turnExpiresAtRef.current !== null &&
+              turnExpiresAtRef.current > Date.now()) return;
+          iceServersRef.current = res.iceServers;
+          // Keep an expired timestamp on failure so the idle timer can retry.
+          if (res.expiresAt !== null) turnExpiresAtRef.current = res.expiresAt;
+          const pc = pcRef.current;
+          if (pc && pc.signalingState !== 'closed') {
+            try { pc.setConfiguration(rtcConfiguration(res.iceServers)); }
+            catch { rtcTraceRef.current?.mark('turn-configuration-rejected'); }
           }
         })
+        .catch(() => { /* cancelled when the room or socket effect changes */ })
         .finally(() => {
-          if (turnFetchPromiseRef.current === promise) {
-            turnFetchPromiseRef.current = null;
-          }
+          if (turnRequest === request) turnRequest = undefined;
         });
-      turnFetchPromiseRef.current = promise;
     };
+    const turnRefreshTimer = TURN_ENABLED ? setInterval(() => {
+      const token = resumeTokenRef.current;
+      if (token && wsConnectedRef.current && authenticatedSessionRef.current &&
+          turnExpiresAtRef.current !== null && Date.now() >= turnRetryAt &&
+          !isTransferActiveRef.current && !incomingReceiverIdRef.current) {
+        refreshTurnIceServers(activeRoomRef.current, token);
+      }
+    }, 60_000) : undefined;
 
     const socketManager = createReconnectingSocket(wsUrl, {
       onOpen: (ws) => {
@@ -2253,6 +2274,8 @@ export function usePeerDrop(wsUrl: string) {
       if (mountGen === sessionGenerationRef.current) {
         sessionGenerationRef.current++;
       }
+      clearInterval(turnRefreshTimer);
+      turnRequest?.controller.abort();
       resilience.dispose();
       if (resilienceRef.current === resilience) {
         resilienceRef.current = null;
@@ -2432,15 +2455,26 @@ export function usePeerDrop(wsUrl: string) {
     [sendJsonPacket]
   );
 
-  const acceptIncomingFile = useCallback(() => {
+  const acceptIncomingFile = useCallback(async (saveDirectly = false) => {
     if (!incomingOffer) return;
-    offerResRef.current.accept(incomingOffer.offerId, sessionGenerationRef.current);
+    const generation = sessionGenerationRef.current;
+    let handle: FileSystemFileHandle | undefined;
+    if (saveDirectly) {
+      if (!incomingOffer.transferId || !isV2Active()) return false;
+      const destination = await chooseSaveLocation(incomingOffer.name);
+      if (!destination) return false;
+      // The existing picker returns the browser's native FileSystemFileHandle.
+      handle = destination as FileSystemFileHandle;
+    }
+    if (generation !== sessionGenerationRef.current ||
+        (incomingOffer.transferId && !offerResRef.current.accept(incomingOffer.offerId, generation))) return false;
     if (incomingOffer.transferId) {
       approvedOffersRef.current.set(incomingOffer.transferId, {
         name: incomingOffer.name,
         size: incomingOffer.size,
         mime: incomingOffer.mime,
         at: Date.now(),
+        handle,
       });
     }
     sendJsonPacket({
@@ -2450,7 +2484,7 @@ export function usePeerDrop(wsUrl: string) {
     });
     incomingOfferRef.current = false;
     setIncomingOffer(null);
-  }, [incomingOffer, sendJsonPacket]);
+  }, [incomingOffer, isV2Active, sendJsonPacket]);
 
   const declineIncomingFile = useCallback(() => {
     if (!incomingOffer) return;
@@ -2625,6 +2659,7 @@ export function usePeerDrop(wsUrl: string) {
             fileMime: mime,
             totalBytes: file.size,
             transferredBytes: s.bytes,
+            transferPhase: s.phase,
             speedMbps: Number((s.speedBps / (1024 * 1024)).toFixed(2)),
             etaSeconds: Number.isFinite(s.etaSeconds) ? s.etaSeconds : 0,
             progress: s.progress,
@@ -2969,6 +3004,7 @@ export function usePeerDrop(wsUrl: string) {
     sendTextOrLink,
     sendFile,
     acceptIncomingFile,
+    canSaveIncomingDirectly: Boolean(incomingOffer?.transferId && isV2Active() && supportsNativeSavePicker()),
     declineIncomingFile,
     cancelTransfer,
   };

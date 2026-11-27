@@ -7,20 +7,22 @@ const transferErrors = new Set([
 ]);
 
 interface RelayEvents {
-  admitted: () => void;
+  admitted: (resumeToken: string) => void;
   paired: () => void;
+  heartbeat?: (elapsedMs: number) => void;
   message: (packet: unknown) => void;
   binary: (frame: ArrayBuffer) => void;
   failure: (reason: string) => void;
 }
 
-export function connectDiagnosticRelay(room: string, host: boolean, events: RelayEvents) {
+export function connectDiagnosticRelay(room: string, host: boolean, events: RelayEvents, credentialsOnly = false) {
   const socket = new WebSocket(resolveWebSocketUrl());
   socket.binaryType = 'arraybuffer';
   let authenticated = false;
   let peerId: string | undefined;
   let ready = false;
   let welcomed = false;
+  let pingAt: number | undefined;
 
   function send(packet: object) {
     if (socket.readyState !== WebSocket.OPEN) throw new Error('Relay closed');
@@ -50,8 +52,8 @@ export function connectDiagnosticRelay(room: string, host: boolean, events: Rela
       } else if (packet.type === (host ? 'room-created' : 'room-joined') && packet.roomCode === room &&
         typeof packet.resumeToken === 'string' && packet.resumeToken.length > 0) {
         authenticated = true;
-        events.admitted();
-      } else if (authenticated && packet.type === 'room-peers' && packet.roomCode === room && Array.isArray(packet.peers)) {
+        events.admitted(packet.resumeToken);
+      } else if (!credentialsOnly && authenticated && packet.type === 'room-peers' && packet.roomCode === room && Array.isArray(packet.peers)) {
         const peer = packet.peers.length === 1 ? packet.peers[0] : undefined;
         const id = peer?.networkVersion === 2 && typeof peer.id === 'string' ? peer.id : undefined;
         if (peerId && peerId !== id) {
@@ -65,9 +67,16 @@ export function connectDiagnosticRelay(room: string, host: boolean, events: Rela
         if (payload?.type === 'diagnostic-hello' && payload.version === 1 && !ready) {
           ready = true;
           events.paired();
+          if (events.heartbeat) {
+            pingAt = performance.now();
+            send({ type: 'ping' });
+          }
         } else if (ready) {
           events.message(payload);
         }
+      } else if (packet.type === 'pong' && pingAt !== undefined) {
+        events.heartbeat?.(Math.round(performance.now() - pingAt));
+        pingAt = undefined;
       } else if (packet.type === 'room-error') {
         events.failure(roomErrors.has(packet.code) ? packet.code : 'Diagnostic room unavailable');
       } else if (ready && packet.type === 'peer-reconnecting') {

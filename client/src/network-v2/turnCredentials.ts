@@ -15,3 +15,17 @@ export function parseTurnResponse(raw:unknown, now=Date.now()):TurnResponse {
   return result;
 }
 export function turnNeedsRefresh(expiresAt:number|null,now=Date.now(),marginMs=300000){return expiresAt===null||expiresAt-now<=marginMs;}
+
+export type TurnProtocol = 'any' | 'udp' | 'tcp' | 'tls';
+export function filterTurnServers(servers: RTCIceServer[], protocol: TurnProtocol, includeStun: boolean): RTCIceServer[] {
+  return servers.flatMap((server) => {
+    const urls = (Array.isArray(server.urls) ? server.urls : [server.urls]).filter((url) => {
+      if (url.startsWith('stun:')) return includeStun;
+      if (!/^turns?:/i.test(url)) return false;
+      if (protocol === 'any') return true;
+      if (protocol === 'tls') return url.startsWith('turns:');
+      return url.startsWith('turn:') && url.endsWith(`?transport=${protocol}`);
+    });
+    return urls.length ? [{ ...server, urls }] : [];
+  });
+}

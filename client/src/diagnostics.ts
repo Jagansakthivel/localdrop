@@ -1,7 +1,9 @@
 import { createReceiver, type EndMessage, type ResultMessage, type TransferPath } from './network-v2/engine';
 import { connectDiagnosticRelay } from './network-v2/diagnosticRelay';
+import { fetchDiagnosticTurn } from './network-v2/diagnosticTurn';
+import { filterTurnServers, type TurnProtocol } from './network-v2/turnCredentials';
 import { createFileSink, type FileSink } from './network-v2/fileSink';
-import { createChannels, selectedPath, STUN } from './network-v2/transportRace';
+import { classifyCandidatePair, createChannels, STUN } from './network-v2/transportRace';
 import { transferTiming } from './network-v2/transferTiming';
 import { sendVerified, type SenderControl } from './network-v2/verifiedSend';
 import { chunkSize, HEADER, MAX_FRAME, validateMeta, WINDOW, type FileMeta } from './network-v2/wire';
@@ -14,6 +16,14 @@ const remote = element<HTMLTextAreaElement>('remote');
 const local = element<HTMLTextAreaElement>('local');
 const topology = element<HTMLSelectElement>('topology');
 const ice = element<HTMLSelectElement>('ice');
+if (import.meta.env.VITE_ENABLE_TURN !== 'true') {
+  ice.querySelector('option[value="turn"]')?.remove();
+  ice.querySelector('option[value="forced-turn"]')?.remove();
+  element('turn-protocol').closest('label')?.setAttribute('hidden', '');
+}
+const relayFrame = element<HTMLSelectElement>('relay-frame');
+const relayChunkSizes = [16, 64, 128, 256].map((kib) => kib * 1024 - HEADER);
+const turnProtocol = element<HTMLSelectElement>('turn-protocol');
 const storage = element<HTMLSelectElement>('sink');
 const report = element<HTMLPreElement>('report');
 const maxBytes = 128 * 1024 * 1024;
@@ -35,7 +45,7 @@ const reportReasons = new Set([
   'Cancelled locally', 'Page closed', 'Probe disconnected', 'Data channel closed',
   'Data channel error', 'Data channel lost', 'Data channel buffer stalled',
   'Control channel closed', 'Bulk channel closed', 'Bulk channels not ready',
-  'Receiver credit timeout', 'Peer acknowledgement timed out', 'Receiver transfer stalled',
+  'Receiver credit timeout', 'Peer acknowledgement timed out', 'Receiver transfer stalled', 'Receiver storage quota exceeded',
   'Peer cancelled', 'Peer rejected probe; see receiver report', 'SHA-256 mismatch',
   'File size mismatch', 'Invalid end message', 'Unexpected file id',
   'Invalid or duplicate chunk index', 'Invalid chunk size or flags',
@@ -50,6 +60,7 @@ const reportReasons = new Set([
   'Relay session probe limit reached', 'Invalid relay probe metadata', 'Diagnostic room unavailable',
   'Relay credit rate exceeded', 'Invalid credit frame', 'Credit exceeds outstanding data',
   'Relay bandwidth quota exceeded', 'Invalid relay ledger', 'Relay requires exactly one paired peer',
+  'TURN credentials unavailable', 'Selected TURN protocol unavailable',
   'ROOM_NOT_FOUND', 'ROOM_TAKEN', 'ROOM_FULL', 'INVALID_PIN', 'TOO_MANY_ATTEMPTS',
 ]);
 const browserErrorNames = new Set([
@@ -81,10 +92,10 @@ function throughput(bytes: number, start: number) {
   return { bytes, elapsedMs, mbps: Number((bytes * 8 / Math.max(1, elapsedMs) / 1000).toFixed(2)) };
 }
 
-function createProbe(room?: { code: string; host: boolean }) {
+function createProbe(room?: { code: string; host: boolean }, configuration?: RTCConfiguration) {
   const single = topology.value === 'single';
   const hostOnly = ice.value === 'host';
-  const pc = room ? null : new RTCPeerConnection({ iceServers: hostOnly ? [] : STUN });
+  const pc = room ? null : new RTCPeerConnection(configuration ?? { iceServers: hostOnly ? [] : STUN });
   let relay: ReturnType<typeof connectDiagnosticRelay> | undefined;
   let relayReady = false;
   let sentProbes = 0;
@@ -115,8 +126,9 @@ function createProbe(room?: { code: string; host: boolean }) {
         element<HTMLOutputElement>('relay-room').textContent = `Paired in room ${room?.code}`;
         return;
       }
-      void Promise.all([selectedPath(pc), inspectPeerStats(pc)]).then(([path, stats]) => {
-        log('selected-path', { ...path, pair: stats.selectedPair });
+      void inspectPeerStats(pc).then((stats) => {
+        log('selected-path', { ...classifyCandidatePair(stats.selectedPair), pair: stats.selectedPair,
+          iceState: stats.iceState, dtlsState: stats.dtlsState, sctpState: stats.sctpState });
       }, () => log('path-stats-unavailable'));
     }
   }
@@ -156,7 +168,7 @@ function createProbe(room?: { code: string; host: boolean }) {
       if (meta.size > maxBytes) throw new Error('File exceeds diagnostic limit');
       if (room) {
         if (receivedProbes >= relayProbeLimit) throw new Error('Relay session probe limit reached');
-        if (meta.chunkSize !== MAX_FRAME - HEADER) throw new Error('Invalid relay probe metadata');
+        if (!relayChunkSizes.includes(meta.chunkSize)) throw new Error('Invalid relay probe metadata');
         receivedProbes++;
       }
       const sinkMode = storage.value;
@@ -196,6 +208,8 @@ function createProbe(room?: { code: string; host: boolean }) {
       let written = 0;
       receiver = createReceiver({
         meta, sink: output, signal: scope.signal, measure: timing.measure,
+        // Match the two-full-frame credit cadence used by the standard relay.
+        creditBatchBytes: room ? 2 * (MAX_FRAME - HEADER) : undefined,
         sendCredit: (frame) => relay ? relay.socket.send(frame) : control().send(frame),
         record: (bytes) => {
           if (!written && bytes) log('first-chunk-written');
@@ -298,6 +312,7 @@ function createProbe(room?: { code: string; host: boolean }) {
           ? `Room ${room.code}. Waiting for the other diagnostic page.` : 'Waiting for the other diagnostic page…';
       },
       paired: () => { relayReady = true; refresh(); },
+      heartbeat: (elapsedMs) => log('relay-heartbeat', { elapsedMs }),
       message: handleControl,
       binary: (frame) => {
         if (frame.byteLength === 5) onCredit?.(frame);
@@ -321,7 +336,7 @@ function createProbe(room?: { code: string; host: boolean }) {
       : { kind: 'rtc', bulk: labels.slice(1).map((label) => channels.get(label)!) };
     const meta: FileMeta = {
       transferId: crypto.randomUUID(), fileId: fileId++ & 0xffff,
-      name: 'probe.bin', mime: 'application/octet-stream', size: file.size, chunkSize: relay ? MAX_FRAME - HEADER : chunkSize(pc ?? undefined),
+      name: 'probe.bin', mime: 'application/octet-stream', size: file.size, chunkSize: relay ? Number(relayFrame.value) * 1024 - HEADER : chunkSize(pc ?? undefined),
     };
     outgoing = true;
     refresh();
@@ -359,11 +374,13 @@ function createProbe(room?: { code: string; host: boolean }) {
   }
 
   const browser = navigator.userAgent.match(/(?:Firefox|EdgA?|Chrome|Version)\/\d+/)?.[0];
-  log('start', { topology: room ? 'relay' : single ? 'single' : 'striped', hostOnly: room ? undefined : hostOnly, browser });
+  const platform = /Android|iPhone|iPad|Windows|Macintosh|Linux/.exec(navigator.userAgent)?.[0];
+  log('start', { platform, iceMode: room ? undefined : ice.value, topology: room ? 'relay' : single ? 'single' : 'striped', hostOnly: room ? undefined : hostOnly, browser });
   return { pc, signal: scope.signal, startChannels, send, close, arm: () => { armed = true; refresh(); } };
 }
 
 let probe: ReturnType<typeof createProbe> | undefined;
+let preparingTurn: AbortController | undefined;
 
 async function exportDescription(current: NonNullable<typeof probe>, description: RTCSessionDescriptionInit) {
   if (!current.pc) return;
@@ -404,9 +421,11 @@ async function importDescription(current: NonNullable<typeof probe>, type: 'offe
 }
 
 function reset(reason: string) {
+  preparingTurn?.abort();
+  preparingTurn = undefined;
   probe?.close(reason);
   probe = undefined;
-  topology.disabled = ice.disabled = false;
+  topology.disabled = ice.disabled = turnProtocol.disabled = false;
   local.value = remote.value = input('room-code').value = '';
   element<HTMLOutputElement>('relay-room').textContent = '';
 }
@@ -421,21 +440,49 @@ function action(id: string, run: () => Promise<void>) {
   };
 }
 
-function begin(room?: { code: string; host: boolean }) {
+function begin(room?: { code: string; host: boolean }, configuration?: RTCConfiguration) {
   if (probe && !probe.signal.aborted) throw new Error('Disconnect before starting a new probe');
-  probe = createProbe(room);
-  topology.disabled = ice.disabled = true;
+  probe = createProbe(room, configuration);
+  topology.disabled = ice.disabled = turnProtocol.disabled = true;
   return probe;
 }
 
+async function beginRtc() {
+  if (preparingTurn || (probe && !probe.signal.aborted)) throw new Error('Disconnect before starting a new probe');
+  const mode = ice.value;
+  if (mode !== 'turn' && mode !== 'forced-turn') return begin();
+  const controller = new AbortController();
+  preparingTurn = controller;
+  topology.disabled = ice.disabled = turnProtocol.disabled = true;
+  const protocol = turnProtocol.value as TurnProtocol;
+  const started = now();
+  try {
+    const response = await fetchDiagnosticTurn(newRoomCode(), controller.signal);
+    controller.signal.throwIfAborted();
+    const forced = mode === 'forced-turn';
+    log('turn-credentials', { status: response.status, requestMs: response.requestMs, elapsedMs: Math.round(now() - started),
+      lifetimeSeconds: response.expiresAt === null ? null : Math.round((response.expiresAt - Date.now()) / 1000),
+      protocol, forced });
+    if (response.status !== 'turn-issued') throw new Error('TURN credentials unavailable');
+    const servers = filterTurnServers(response.iceServers, protocol, forced === false);
+    if (!servers.some((server) => server.username)) throw new Error('Selected TURN protocol unavailable');
+    return begin(undefined, { iceServers: servers, iceTransportPolicy: forced ? 'relay' : 'all' });
+  } finally {
+    if (preparingTurn === controller) {
+      preparingTurn = undefined;
+      if (!probe || probe.signal.aborted) topology.disabled = ice.disabled = turnProtocol.disabled = false;
+    }
+  }
+}
+
 action('offer', async () => {
-  const current = begin();
+  const current = await beginRtc();
   if (!current.pc) return;
   current.startChannels();
   await exportDescription(current, await current.pc.createOffer());
 });
 action('answer', async () => {
-  const current = begin();
+  const current = await beginRtc();
   if (!current.pc) return;
   await importDescription(current, 'offer');
   await exportDescription(current, await current.pc.createAnswer());
@@ -445,10 +492,14 @@ action('apply', async () => {
   await importDescription(probe, 'answer');
   local.value = '';
 });
+function newRoomCode() {
+  return String(1000 + Math.floor(crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32 * 9000));
+}
+
 function startRelay(host: boolean) {
   if (topology.value !== 'relay') return;
   const code = host
-    ? String(1000 + Math.floor(crypto.getRandomValues(new Uint32Array(1))[0] / 2 ** 32 * 9000))
+    ? newRoomCode()
     : input('room-code').value.trim();
   if (!/^\d{4}$/.test(code)) throw new Error('INVALID_PIN');
   begin({ code, host });

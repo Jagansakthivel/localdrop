@@ -26,7 +26,7 @@ import {
   History,
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
-import type { ConnectionState, TransportType } from '../types/network';
+import type { ConnectionState, NetworkDiagnostics, TransportType } from '../types/network';
 import { springs } from '../motion-presets';
 import { LocalDropHeader, LocalDropFooter } from './LocalDropChrome';
 import { Handshake, FileStack, TransferMotion, type StagedFile } from './LocalDropMotion';
@@ -88,6 +88,7 @@ export type Props = {
   error?: string;
   connectionState?: ConnectionState;
   transport?: TransportType;
+  pathKind?: NetworkDiagnostics['pathKind'];
   // Diagnostics & Session extras
   wsConnected: boolean;
   autoAccept: boolean;
@@ -109,7 +110,8 @@ export type Props = {
     fromName: string;
     senderDeviceType?: 'mobile' | 'desktop';
   } | null;
-  onAcceptOffer: () => void;
+  onAcceptOffer: (saveDirectly?: boolean) => Promise<boolean | void>;
+  canSaveIncomingDirectly: boolean;
   onDeclineOffer: () => void;
   sharedItems: Array<{
     id: string;
@@ -216,7 +218,7 @@ export default function LocalDrop(p: Props) {
     }));
   }, [normalizedStaged, thumbnails]);
 
-  const tCopy = getTransportCopy(p.connectionState, p.transport, p.wsConnected);
+  const tCopy = getTransportCopy(p.connectionState, p.transport, p.wsConnected, p.pathKind);
   const eligiblePdfCount = useMemo(
     () =>
       p.sharedItems.filter(
@@ -398,7 +400,8 @@ export default function LocalDrop(p: Props) {
         {/* AirDrop-Style Premium Animated Incoming Transfer Popup */}
         <IncomingTransferPopup
           offer={popupOffer}
-          onAccept={p.onAcceptOffer}
+          onAccept={(_, saveDirectly) => p.onAcceptOffer(saveDirectly)}
+          canSaveDirectly={p.canSaveIncomingDirectly}
           onDecline={p.onDeclineOffer}
           receiverDeviceType={isReceiverMobile ? 'mobile' : 'desktop'}
         />

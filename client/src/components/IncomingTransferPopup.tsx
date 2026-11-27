@@ -27,7 +27,8 @@ export interface IncomingTransferOffer {
 
 export interface IncomingTransferPopupProps {
   offer: IncomingTransferOffer | null;
-  onAccept: (id: string) => void | Promise<void>;
+  onAccept: (id: string, saveDirectly?: boolean) => boolean | void | Promise<boolean | void>;
+  canSaveDirectly?: boolean;
   onDecline: (id: string) => void | Promise<void>;
   receiverDeviceType?: 'mobile' | 'desktop';
 }
@@ -75,6 +76,7 @@ function TransferFilePreviewIcon({
 export function IncomingTransferPopup({
   offer,
   onAccept,
+  canSaveDirectly,
   onDecline,
   receiverDeviceType = 'desktop',
 }: IncomingTransferPopupProps) {
@@ -137,7 +139,7 @@ export function IncomingTransferPopup({
     }
   };
 
-  async function respond(action: 'accepted' | 'declined') {
+  async function respond(action: 'accepted' | 'declined', saveDirectly = false) {
     const targetOffer = offer;
     if (!targetOffer || processingRef.current) return;
 
@@ -148,7 +150,10 @@ export function IncomingTransferPopup({
 
     try {
       if (action === 'accepted') {
-        await onAccept(offerId);
+        if (await onAccept(offerId, saveDirectly) === false) {
+          processingRef.current = false;
+          setDecision('idle');
+        }
       } else {
         await onDecline(offerId);
       }
@@ -317,6 +322,13 @@ export function IncomingTransferPopup({
                 {decision === 'accepted' ? 'Accepting…' : 'Accept'}
               </motion.button>
             </div>
+
+            {canSaveDirectly && (
+              <button type="button" className="ld-incoming-accept"
+                disabled={decision !== 'idle'} onClick={() => void respond('accepted', true)}>
+                Save directly…
+              </button>
+            )}
 
             {error && (
               <p className="ld-incoming-error" role="alert">

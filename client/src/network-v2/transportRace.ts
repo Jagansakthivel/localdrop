@@ -1,19 +1,21 @@
+import { inspectPeerStats } from '../utils/rtcDiagnostics';
 import { checkAbort } from './wire';
 import { abortScope } from './abortScope';
 import { parseTurnResponse } from './turnCredentials';
 export type PathKind='webrtc-lan'|'webrtc-wan'|'webrtc-turn'|'webrtc-unknown'|'ws-relay';
 export interface CandidatePath { kind:PathKind; localType?:string; remoteType?:string; protocol?:string }
-export async function selectedPath(pc:RTCPeerConnection):Promise<CandidatePath>{
-  const stats=await pc.getStats();let selected:string|undefined;
-  stats.forEach((r:RTCStats & {selectedCandidatePairId?:string})=>{if(r.type==='transport'&&r.selectedCandidatePairId)selected=r.selectedCandidatePairId;});
-  if(!selected)return {kind:'webrtc-unknown'};
-  const pair=stats.get(selected) as (RTCStats & {localCandidateId?:string;remoteCandidateId?:string})|undefined;
-  if(!pair?.localCandidateId||!pair.remoteCandidateId)return {kind:'webrtc-unknown'};
-  const l=stats.get(pair.localCandidateId) as {candidateType?:string;protocol?:string}|undefined;
-  const r=stats.get(pair.remoteCandidateId) as {candidateType?:string}|undefined;
-  const localType=l?.candidateType,remoteType=r?.candidateType;
-  const kind=localType==='relay'||remoteType==='relay'?'webrtc-turn':localType==='host'&&remoteType==='host'?'webrtc-lan':localType&&remoteType?'webrtc-wan':'webrtc-unknown';
-  return {kind,localType,remoteType,protocol:l?.protocol};
+export function classifyCandidatePair(pair: Awaited<ReturnType<typeof inspectPeerStats>>['selectedPair']): CandidatePath {
+  const localType = pair?.localType ?? undefined;
+  const remoteType = pair?.remoteType ?? undefined;
+  const directTypes = ['host', 'srflx', 'prflx'];
+  const kind = localType === 'relay' || remoteType === 'relay' ? 'webrtc-turn'
+    : localType === 'host' && remoteType === 'host' ? 'webrtc-lan'
+    : localType && remoteType && directTypes.includes(localType) && directTypes.includes(remoteType)
+      ? 'webrtc-wan' : 'webrtc-unknown';
+  return { kind, localType, remoteType, protocol: pair?.protocol ?? undefined };
+}
+export async function selectedPath(pc: RTCPeerConnection): Promise<CandidatePath> {
+  return classifyCandidatePair((await inspectPeerStats(pc)).selectedPair);
 }
 export const STUN:RTCIceServer[]=[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];
 let certificate:RTCCertificate|undefined;let warming:Promise<void>|undefined;
@@ -63,6 +65,8 @@ export function startTransportRace(o:RaceOptions){
 export type TurnFetchStatus =
   | 'turn-issued'
   | 'turn-not-configured'
+  | 'turn-upstream-unavailable'
+  | 'turn-unavailable'
   | 'turn-auth-failed'
   | 'turn-quota-or-forbidden'
   | 'turn-timeout'
@@ -70,6 +74,7 @@ export type TurnFetchStatus =
 export async function fetchIceServersWithExpiry(wsUrl:string,token:string,roomCode:string,signal:AbortSignal):Promise<{iceServers:RTCIceServer[];expiresAt:number|null;status:TurnFetchStatus}>{
   checkAbort(signal);const u=new URL(wsUrl,location.href);u.protocol=u.protocol==='wss:'?'https:':'http:';u.pathname='/api/ice-servers';u.search='';u.hash='';
   const scope=abortScope([signal],2500);
+  const requestedAt = Date.now();
   try{
     const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},body:JSON.stringify({roomCode}),signal:scope.signal,cache:'no-store'});
     if(!r.ok){
@@ -78,8 +83,11 @@ export async function fetchIceServersWithExpiry(wsUrl:string,token:string,roomCo
     }
     const body:unknown=await r.json();
     const parsed=parseTurnResponse(body);
-    const status:TurnFetchStatus=parsed.iceServers.length>0?'turn-issued':'turn-not-configured';
-    return {iceServers:[...STUN,...parsed.iceServers],expiresAt:parsed.expiresAt,status};
+    const reported = body && typeof body === 'object' && 'turnStatus' in body ? body.turnStatus : undefined;
+    const status:TurnFetchStatus=parsed.iceServers.length>0?'turn-issued'
+      : reported==='not-configured'?'turn-not-configured'
+      : reported==='upstream-unavailable'?'turn-upstream-unavailable':'turn-unavailable';
+    return {iceServers:[...STUN,...parsed.iceServers],expiresAt:parsed.expiresAt === null ? null : parsed.expiresAt - (Date.now() - requestedAt),status};
   }catch{
     checkAbort(signal);
     return {iceServers:STUN,expiresAt:null,status:scope.signal.aborted?'turn-timeout':'turn-invalid-response'};
